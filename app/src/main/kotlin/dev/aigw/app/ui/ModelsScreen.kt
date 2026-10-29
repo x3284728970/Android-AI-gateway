@@ -86,6 +86,8 @@ fun ModelsScreen(state: AppUiState, viewModel: AppViewModel) {
             .filter { it.providerId in active }
             .groupBy { it.routePrefix }
     }
+    // 顶部计数用「过滤后」的数量，否则报「共 103 个」而列表只有 80 条，自相矛盾
+    val visibleCount = remember(grouped) { grouped.values.sumOf { it.size } }
     val exposure = state.modelExposure
     // 折叠状态：记「被折叠」的分组（默认全展开）。
     //
@@ -124,9 +126,9 @@ fun ModelsScreen(state: AppUiState, viewModel: AppViewModel) {
     val totalProviders = state.modelLoadStates.size
     val doneProviders = state.modelLoadStates.values.count { it !is ModelLoadState.Loading }
     val subtitleText = if (state.modelsLoading) {
-        if (totalProviders > 0) "共 ${state.models.size} 个 · 载入中 ($doneProviders/$totalProviders)" else "共 ${state.models.size} 个 · 更新中..."
+        if (totalProviders > 0) "共 $visibleCount 个 · 载入中 ($doneProviders/$totalProviders)" else "共 $visibleCount 个 · 更新中..."
     } else {
-        "共 ${state.models.size} 个"
+        "共 $visibleCount 个"
     }
 
     // 还在加载中的供应商列表

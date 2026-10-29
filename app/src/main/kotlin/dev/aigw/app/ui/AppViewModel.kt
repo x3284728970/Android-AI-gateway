@@ -570,7 +570,12 @@ class AppViewModel(
             }
             if (gen != modelsGeneration) return@launch
             // 全部完成后用最终聚合覆盖：失败供应商的旧条目随之清除（与整体刷新语义一致）
-            val providerError = catalog.failures.entries.joinToString("；") { "${it.key}：${it.value}" }
+            // 没有可用账号的供应商不参与报错：它们本来就拉不到目录，模型列表里也已经隐藏，
+            // 再把「未登录」挂到页头只会让人以为出故障了（有账号的那些才值得报）。
+            val activeProviders = _state.value.accounts.filter { it.usable }.map { it.providerId }.toSet()
+            val providerError = catalog.failures.entries
+                .filter { it.key in activeProviders }
+                .joinToString("；") { "${it.key}：${it.value}" }
             _state.value = _state.value.copy(
                 models = catalog.models,
                 modelsLoading = false,
