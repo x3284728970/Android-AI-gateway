@@ -167,14 +167,23 @@ class DumatePointsActivity : Activity() {
         val quotaBody = bodyOf(root, "quota")
         if (quotaBody.startsWith("{")) {
             val quota = runCatching { JsonParser.parseString(quotaBody) }.getOrNull()?.asJsonObject
-            val remain = quota?.findLong(listOf("remain_points", "remaining", "remain", "available", "balance"))
-            val total = quota?.findLong(listOf("total_points", "total", "quota", "limit"))
+            // 实测（2026-10-29）响应形状：{code, success, result:{isSubscribed, usedPoints:"0.00",
+            // modelThrottleInfo:{...}}}。**没有 remain/total**——搭子是订阅制，讲「已用积分」
+            // 与模型限流额度，不是余额制。数字是字符串小数（"0.00"），要按 Double 解析。
+            val remain = quota?.findNumber(listOf("remainPoints", "remainingPoints", "remain_points", "availablePoints", "balance"))
+            val total = quota?.findNumber(listOf("totalPoints", "total_points", "quota", "limit"))
+            val used = quota?.findNumber(listOf("usedPoints", "used_points", "used"))
+            val subscribed = quota?.findBool(listOf("isSubscribed", "subscribed", "vip"))
             when {
-                remain != null && total != null && total > 0 -> parts.add("余额 $remain/$total")
-                remain != null -> parts.add("余额 $remain")
+                remain != null && total != null && total > 0 ->
+                    parts.add("余额 ${fmt(remain)}/${fmt(total)}")
+                remain != null -> parts.add("余额 ${fmt(remain)}")
+                subscribed == true && used != null ->
+                    parts.add("订阅制已开通 · 已用 ${fmt(used)} 积分")
+                used != null -> parts.add("已用 ${fmt(used)} 积分")
                 // 认不出字段名时把原始响应带上：界面上的提示是唯一的诊断入口，
                 // 让它自证比让用户去翻日志靠谱。
-                else -> parts.add("余额解析失败，原始响应：" + quotaBody.take(160))
+                else -> parts.add("额度解析失败，原始响应：" + quotaBody.take(700))
             }
         }
 
@@ -193,19 +202,39 @@ class DumatePointsActivity : Activity() {
     private fun JsonObject.longLike(key: String): Long? =
         get(key)?.takeIf { it.isJsonPrimitive }?.let { runCatching { it.asLong }.getOrNull() }
 
-    /** 在整棵对象树里找第一个能当数字读的键（响应形状不固定）。 */
-    private fun JsonObject.findLong(keys: List<String>): Long? {
+    /** 在整棵对象树里找第一个能当数字读的键（值可能是 "0.00" 这种字符串小数）。 */
+    private fun JsonObject.findNumber(keys: List<String>): Double? {
         for (entry in entrySet()) {
             if (entry.key in keys && entry.value.isJsonPrimitive) {
-                val v = runCatching { entry.value.asJsonPrimitive.asLong }.getOrNull()
+                val v = runCatching { entry.value.asJsonPrimitive.asDouble }.getOrNull()
                 if (v != null) return v
             }
             if (entry.value.isJsonObject) {
-                val nested = entry.value.asJsonObject.findLong(keys)
+                val nested = entry.value.asJsonObject.findNumber(keys)
                 if (nested != null) return nested
             }
         }
         return null
+    }
+
+    private fun JsonObject.findBool(keys: List<String>): Boolean? {
+        for (entry in entrySet()) {
+            if (entry.key in keys && entry.value.isJsonPrimitive) {
+                val v = runCatching { entry.value.asJsonPrimitive.asBoolean }.getOrNull()
+                if (v != null) return v
+            }
+            if (entry.value.isJsonObject) {
+                val nested = entry.value.asJsonObject.findBool(keys)
+                if (nested != null) return nested
+            }
+        }
+        return null
+    }
+
+    /** 整数不带小数点，免得显示「已用 0.00 积分」这种别扭文案。 */
+    private fun fmt(value: Double): String {
+        val whole = Math.floor(value)
+        return if (value == whole && !value.isInfinite()) whole.toLong().toString() else "%.2f".format(value)
     }
 
     private fun deliver(raw: String) {
