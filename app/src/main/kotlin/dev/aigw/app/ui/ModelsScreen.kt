@@ -72,8 +72,20 @@ import dev.aigw.core.provider.RoutedModel
 fun ModelsScreen(state: AppUiState, viewModel: AppViewModel) {
     val context = LocalContext.current
     val clipboard = LocalClipboardManager.current
-    // 按 routePrefix 分组：区域型供应商（如 WorkBuddy 国内与国外）各成一个分组
-    val grouped = remember(state.models) { state.models.groupBy { it.routePrefix } }
+    // 按 routePrefix 分组：区域型供应商（如 WorkBuddy 国内与国外）各成一个分组。
+    //
+    // **只列已登录（有启用账号）的供应商**：没有账号时各家给的是内置兜底目录，
+    // 点进去也调不通，列在这里只会让人以为模型可用。过滤放在 UI 层而不是引擎里——
+    // 引擎那层要对「无账号」保持可测的语义（单测就是拿无账号的假供应商当夹具）。
+    val grouped = remember(state.models, state.accounts) {
+        val active = state.accounts
+            .filter { it.usable }
+            .map { it.providerId }
+            .toSet()
+        state.models
+            .filter { it.providerId in active }
+            .groupBy { it.routePrefix }
+    }
     val exposure = state.modelExposure
     // 折叠状态：记「被折叠」的分组（默认全展开）。
     //
