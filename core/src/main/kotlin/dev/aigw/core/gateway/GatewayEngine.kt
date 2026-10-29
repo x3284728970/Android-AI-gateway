@@ -1341,7 +1341,11 @@ class GatewayEngine(
 
     /** 无区域概念的供应商：用池里挑出的那一个账号拉一份目录。 */
     private fun fetchWholeProviderModels(provider: Provider): ProviderModelsChunk {
-        val view = fetchCatalog(provider, pool.pick(provider.id))
+        // **没有可用账号就不列模型**：这类"目录"是各家内置的兜底表，点进去也调不通，
+        // 只会让人以为已经登录、模型能用。宁可这一格空着。
+        val picked = pool.pick(provider.id)
+        if (picked == null) return ProviderModelsChunk(provider.id, emptyList(), null)
+        val view = fetchCatalog(provider, picked)
         val models = view.models
             .filterNot { settings.onlyUsableModels && provider.isInternalModel(it.id) }
             .map { RoutedModel(provider.id, provider.displayName, it, cached = view.fromFallback) }

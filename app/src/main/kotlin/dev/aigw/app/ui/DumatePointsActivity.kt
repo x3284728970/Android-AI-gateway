@@ -172,7 +172,9 @@ class DumatePointsActivity : Activity() {
             when {
                 remain != null && total != null && total > 0 -> parts.add("余额 $remain/$total")
                 remain != null -> parts.add("余额 $remain")
-                else -> parts.add("余额：响应里没认出数字（原始响应在详情里）")
+                // 认不出字段名时把原始响应带上：界面上的提示是唯一的诊断入口，
+                // 让它自证比让用户去翻日志靠谱。
+                else -> parts.add("余额解析失败，原始响应：" + quotaBody.take(160))
             }
         }
 

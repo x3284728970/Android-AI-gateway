@@ -45,7 +45,8 @@ object TodayConstants {
     /** 倍率表：上游按「同类任务消耗倍数」计价，0 表示限时免费。界面据此标注。 */
     private val RATES = mapOf(
         MODEL_DEEPSEEK to "1×",
-        MODEL_MINIMAX to "0×（限时免费）",
+        // 2026-10-29 用户反馈：M3.1 的限时免费已结束，上游按 1× 计
+        MODEL_MINIMAX to "1×",
         MODEL_GLM to "4×",
     )
 
