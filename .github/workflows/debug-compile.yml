@@ -33,6 +33,12 @@ jobs:
           gradle :app:compileReleaseKotlin --console=plain > /tmp/build.log 2>&1
           echo "exit=$?"
 
+      - name: 单元测试（不中断）
+        run: |
+          set +e
+          gradle :core:test --console=plain >> /tmp/build.log 2>&1
+          echo "exit=$?"
+
       - name: 回传错误到 commit comment
         if: always()
         env:
@@ -50,6 +56,19 @@ jobs:
               log = "(no log)"
 
           errs = [l for l in log.splitlines() if l.startswith("e: ") or " error: " in l]
+          if not errs:
+              # 没有编译错误时，把测试报告里失败的用例与断言消息捞出来
+              import glob, re
+              parts = []
+              for path in glob.glob("core/build/test-results/test/*.xml"):
+                  try:
+                      xml = open(path, encoding="utf-8", errors="replace").read()
+                  except OSError:
+                      continue
+                  for m in re.finditer(r'<testcase name="([^"]+)"[^>]*>\s*<failure[^>]*message="([^"]*)"', xml):
+                      parts.append("FAIL " + m.group(1) + " :: " + m.group(2)[:600])
+              if parts:
+                  errs = parts[:20]
           if errs:
               body = "\n".join(errs[:40])
           else:
