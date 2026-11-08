@@ -1190,7 +1190,7 @@ class AppViewModel(
                 }
             }
             LoginWaitService.stop(app)
-            _state.value = _state.value.copy(busy = "", notice = message)
+            _state.value = _state.value.copy(busy = "", notice = "等待授权超时，请重试")
             refresh()
         }
     }
