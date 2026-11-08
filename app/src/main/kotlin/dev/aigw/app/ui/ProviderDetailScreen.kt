@@ -183,7 +183,6 @@ fun ProviderDetailScreen(
             onRegenerateDeviceId = { id, uid -> viewModel.regenerateDeviceId(id, uid) },
             onSetDeviceId = { id, uid, value -> viewModel.setDeviceId(id, uid, value) },
             onNotice = { viewModel.notice(it) },
-            onMoveAccountPriority = { id, uid, up -> viewModel.moveAccountPriority(id, uid, up) },
         )
     }
 
