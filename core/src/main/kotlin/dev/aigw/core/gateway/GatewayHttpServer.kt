@@ -666,7 +666,8 @@ class GatewayHttpServer(
                     call.close()
                     // 客户端问题（模型名/参数不对）不该连累供应商健康度，
                     // 所以先判定 CLIENT 早返回，再决定是否计入熔断与指标。
-                    if (failure.kind == ErrorKind.CLIENT) {
+                    // QUEUE_WAIT 与 CLIENT 一样不换号：队列是全局共享的，换号必撞同一堵墙
+                    if (failure.kind == ErrorKind.CLIENT || failure.kind == ErrorKind.QUEUE_WAIT) {
                         lastHttpStatus = call.status
                         log("请求被上游拒绝（${currentRoute.providerId}/${account.nickname}）：${failure.message}")
                         if (engine.verboseLogging()) engine.logVerbose("返回原文", call.errorBody)
@@ -679,7 +680,7 @@ class GatewayHttpServer(
                         gateHandle.release()
                         // 客户端侧被拒：状态码与错误码按真实分类给（不再统一写成 upstream_rejected）
                         val mapped = GatewayErrorMapping.map(listOf(failure.kind), attemptedUpstream = true)
-                        return errorResponse(mapped.status, mapped.code, failure.message)
+                        return errorResponse(mapped.status, mapped.code, failure.message, failure.retryAfterSeconds)
                     }
                     if (failure.kind == ErrorKind.SESSION_DEAD) {
                         engine.pool.disable(currentRoute.providerId, account.uid, failure.message)
@@ -751,7 +752,9 @@ class GatewayHttpServer(
                         message = error.message,
                     ).decide()
 
-                    if (error.kind == ErrorKind.CLIENT || decision == dev.aigw.core.failover.FailoverDecision.ABORT_IMMEDIATELY) {
+                    if (error.kind == ErrorKind.CLIENT || error.kind == ErrorKind.QUEUE_WAIT ||
+                        decision == dev.aigw.core.failover.FailoverDecision.ABORT_IMMEDIATELY
+                    ) {
                         // 400/模型名错/内容审核：是客户端问题，健康供应商不应被计入失败计数，
                         // 否则连续几个坏请求就会把正常供应商误判进熔断隔离。
                         lastHttpStatus = call.status
@@ -764,7 +767,7 @@ class GatewayHttpServer(
                         finishActiveRequest()
                         gateHandle.release()
                         val mappedAbort = GatewayErrorMapping.map(listOf(error.kind), attemptedUpstream = true)
-                        return errorResponse(mappedAbort.status, mappedAbort.code, error.message)
+                        return errorResponse(mappedAbort.status, mappedAbort.code, error.message, error.retryAfterSeconds)
                     }
 
                     if (error.kind == ErrorKind.SESSION_DEAD || decision == dev.aigw.core.failover.FailoverDecision.SWITCH_NEXT_PROVIDER) {
@@ -1072,7 +1075,7 @@ class GatewayHttpServer(
                             failures.add(error.kind)
                             // CLIENT = 请求本身不合规（模型名/参数），换号必然再撞同一道墙，
                             // 换家也可能被同一套参数拒绝：直接把上游的原话交给客户端
-                            if (error.kind == ErrorKind.CLIENT) {
+                            if (error.kind == ErrorKind.CLIENT || error.kind == ErrorKind.QUEUE_WAIT) {
                                 log("图像生成被上游拒绝（${route.providerId}/${current.nickname}）：${error.message}")
                                 recordCall(
                                     newCompletionId(), route.providerId, requestedModel, current.uid, current.nickname,
@@ -1080,7 +1083,7 @@ class GatewayHttpServer(
                                     requestSummary, startedAt,
                                 )
                                 val mappedAbort = GatewayErrorMapping.map(listOf(error.kind), attemptedUpstream = true)
-                                return errorResponse(mappedAbort.status, mappedAbort.code, error.message)
+                                return errorResponse(mappedAbort.status, mappedAbort.code, error.message, error.retryAfterSeconds)
                             }
                             continue
                         }
@@ -1271,7 +1274,7 @@ class GatewayHttpServer(
                             failures.add(error.kind)
                             // 上游拒绝的是请求本身（格式/参数），换号换家都会再撞同一道墙，
                             // 直接把上游原话交给客户端
-                            if (error.kind == ErrorKind.CLIENT) {
+                            if (error.kind == ErrorKind.CLIENT || error.kind == ErrorKind.QUEUE_WAIT) {
                                 log("语音转写被上游拒绝（${route.providerId}/${current.nickname}）：${error.message}")
                                 recordCall(
                                     newCompletionId(), route.providerId, requestedModel, current.uid, current.nickname,
@@ -1279,7 +1282,7 @@ class GatewayHttpServer(
                                     requestSummary, startedAt,
                                 )
                                 val mappedAbort = GatewayErrorMapping.map(listOf(error.kind), attemptedUpstream = true)
-                                return errorResponse(mappedAbort.status, mappedAbort.code, error.message)
+                                return errorResponse(mappedAbort.status, mappedAbort.code, error.message, error.retryAfterSeconds)
                             }
                             continue
                         }
@@ -2188,12 +2191,18 @@ class GatewayHttpServer(
             AnthropicProtocol.errorBody(status, message),
         ).apply { addHeader("Connection", "close") }
 
-    private fun errorResponse(status: Int, code: String, message: String): NanoHTTPD.Response =
+    private fun errorResponse(
+        status: Int,
+        code: String,
+        message: String,
+        retryAfterSeconds: Long = 0,
+    ): NanoHTTPD.Response =
         json(status, OpenAiApi.errorBody(code, message)).apply {
             // 错误响应一律关闭连接：请求体的消费状态未知时，残留字节会污染 keep-alive 连接
             addHeader("Connection", "close")
-            // 并发满 / 限流是「稍后重试会好」，告诉客户端退避多久；否则 OpenAI 系客户端不会自动重试
-            if (status == 429) addHeader("Retry-After", "2")
+            // 并发满 / 限流是「稍后重试会好」，告诉客户端退避多久；否则 OpenAI 系客户端不会自动重试。
+            // 上游给了明确口径（CodeBuddy 6020 的 data.retry_after）就用它的，否则保守 2 秒。
+            if (status == 429) addHeader("Retry-After", (retryAfterSeconds.takeIf { it > 0 } ?: 2L).toString())
         }
 
     private fun statusText(status: Int): String = when (status) {

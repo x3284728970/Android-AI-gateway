@@ -19,6 +19,7 @@ object GatewayErrorMapping {
         ErrorKind.SESSION_DEAD,
         ErrorKind.QUOTA,
         ErrorKind.SOFT_RATE,
+        ErrorKind.QUEUE_WAIT,
         ErrorKind.SERVER,
         ErrorKind.NETWORK,
         ErrorKind.NOT_FOUND,
@@ -52,6 +53,8 @@ object GatewayErrorMapping {
                 GatewayFailure(429, "insufficient_quota", "所有候选账号的额度都已耗尽")
             ErrorKind.SOFT_RATE ->
                 GatewayFailure(429, "rate_limit_exceeded", "上游限流：候选账号都在被限流")
+            ErrorKind.QUEUE_WAIT ->
+                GatewayFailure(429, "upstream_queue_waiting", "上游排队中，请按 Retry-After 稍后重试")
             ErrorKind.NETWORK ->
                 GatewayFailure(502, "upstream_unreachable", "连不上上游：请检查网络或代理设置")
             ErrorKind.SERVER ->

@@ -27,6 +27,7 @@ import dev.aigw.core.provider.requestedModelOf
 import dev.aigw.core.provider.ProviderTaskListView
 import dev.aigw.core.provider.QuotaPack
 import dev.aigw.core.provider.StreamFailureChatCall
+import dev.aigw.core.provider.ThinkTag
 import dev.aigw.core.provider.StreamingChatCall
 import dev.aigw.core.provider.UpstreamError
 import dev.aigw.core.provider.ProviderHooks
@@ -42,6 +43,7 @@ import dev.aigw.core.util.jwtClaimLong
 import dev.aigw.core.util.longOrNull
 import dev.aigw.core.util.objOrNull
 import dev.aigw.core.util.str
+import dev.aigw.core.util.stringOrNull
 import java.net.HttpURLConnection
 import java.net.URLEncoder
 import java.text.SimpleDateFormat
@@ -159,7 +161,8 @@ class CodeBuddyProvider internal constructor(
         val stream = conn.inputStream
         if (contentType.contains("event-stream", ignoreCase = true)) {
             if (streaming) {
-                val body = if (restoreNames.isEmpty()) stream else ToolNameRestoringStream(stream, restoreNames)
+                // thinkTag 在这里建、传给流转换器：实例状态必须跨帧（跨片标签要拼回去）
+                val body = ToolNameRestoringStream(stream, restoreNames, ThinkTag())
                 return StreamingChatCall(status, body) { conn.disconnect() }
             }
             val aggregated = try {
@@ -167,7 +170,7 @@ class CodeBuddyProvider internal constructor(
             } finally {
                 conn.disconnect()
             }
-            return AggregatedChatCall(status, restoreToolNames(aggregated, restoreNames))
+            return AggregatedChatCall(status, splitThinkInAggregated(restoreToolNames(aggregated, restoreNames)))
         }
 
         val text = runCatching { stream.use { HttpSupport.readLimited(it) } }.getOrDefault("")
@@ -184,6 +187,11 @@ class CodeBuddyProvider internal constructor(
 
     override fun classify(status: Int, body: String): UpstreamError {
         val message = extractMessage(body)
+        val code = businessCode(body)
+        // 6020（queue.waiting）带 data.retry_after：上游队列按 client_user_type 全局共享，
+        // 换号必然撞同一堵墙，交给网关直接 429 + Retry-After，别再轮转。
+        // 6021（queue.full，无 retry_after）是间歇空窗，仍按限流轮转。
+        val queueWait = code == CODE_QUEUE_WAITING
         val kind = when {
             // 401/403 是凭证失效：必须判 SESSION_DEAD，网关才会禁用该账号并换家。
             // 落到下面的 400..499 → CLIENT 的话会被当作客户端错误早返回，
@@ -192,21 +200,37 @@ class CodeBuddyProvider internal constructor(
             status == 402 -> ErrorKind.QUOTA
             // 429 分两种：业务码 6004 是**该模型**超限（换号无用，换模型立刻可用），
             // 其余 429（无业务码/账号级限流）才按可退避的限流处理。
-            status == 429 -> if (businessCode(body) == CODE_MODEL_LIMITED) ErrorKind.MODEL_LIMIT else ErrorKind.SOFT_RATE
+            status == 429 -> if (code == CODE_MODEL_LIMITED) ErrorKind.MODEL_LIMIT else ErrorKind.SOFT_RATE
             status == 404 -> ErrorKind.NOT_FOUND
             status in 500..599 -> ErrorKind.SERVER
-            businessCode(body) == CODE_MODEL_LIMITED -> ErrorKind.MODEL_LIMIT
+            queueWait -> ErrorKind.QUEUE_WAIT
+            code == CODE_MODEL_LIMITED -> ErrorKind.MODEL_LIMIT
             matchesQuota(body) -> ErrorKind.QUOTA
             matchesSessionDead(body) -> ErrorKind.SESSION_DEAD
             status in 400..499 -> ErrorKind.CLIENT
             else -> ErrorKind.CLIENT
         }
-        return UpstreamError(kind, message.ifEmpty { "上游 HTTP $status" + bodySnippet(body) })
+        return UpstreamError(
+            kind = kind,
+            message = message.ifEmpty { "上游 HTTP $status" + bodySnippet(body) },
+            code = code ?: 0L,
+            retryAfterSeconds = if (kind == ErrorKind.QUEUE_WAIT) queueRetryAfter(body) else 0,
+        )
     }
 
     /** 取响应体里的业务码；取不到/非数字返回 null。 */
     private fun businessCode(body: String): Long? =
         runCatching { JsonParser.parseString(body).asJsonObject.get("code")?.asLong }.getOrNull()
+
+    /**
+     * 6020 的等待口径：`data.retry_after`（秒）。
+     *
+     * 取不到就给一个保守值 2 秒——比让客户端立刻重试又撞墙好。
+     */
+    private fun queueRetryAfter(body: String): Long = runCatching {
+        val data = JsonParser.parseString(body).asJsonObject.objOrNull("data")
+        data?.longOrNull("retry_after")?.takeIf { it > 0 }
+    }.getOrNull() ?: 2L
 
     override fun creditInfo(account: ProviderAccount): CreditInfo? {
         val credential = parse(account) ?: return null
@@ -1509,6 +1533,9 @@ class CodeBuddyProvider internal constructor(
         /** 业务码：该模型已超限（换号无用，换模型立刻可用）。 */
         const val CODE_MODEL_LIMITED = 6004L
 
+        /** 上游队列排队中（queue.waiting）：带 `data.retry_after`，换号无意义。 */
+        const val CODE_QUEUE_WAITING = 6020L
+
         /** 刷新失败后的冷却秒数：期间不再重打上游刷新端点。 */
         const val REFRESH_COOLDOWN_SECONDS = 60L
 
@@ -1650,6 +1677,39 @@ class CodeBuddyProvider internal constructor(
  *    与 `max_completion_tokens` → `max_tokens`；
  * 4. 去掉上游会拦的特征文本（Claude Code / Codex CLI 的系统提示词片段）。
  */
+/**
+ * 非流式聚合结果的内联思考拆分：正文里漏出的 `<think:SUF>…</think:SUF>` 归到
+ * `reasoning_content`（Anthropic 门面会把它转成 thinking 块）。
+ * 只在 content 以 `<think:` 开头时生效，正文中间聊到这几个字不改写。
+ */
+/** 供单测触达 [splitThinkInAggregated]（private 直测不了）。 */
+internal fun splitThinkForTest(body: String): String = splitThinkInAggregated(body)
+
+private fun splitThinkInAggregated(body: String): String {
+    val obj = runCatching { JsonParser.parseString(body).asJsonObject }.getOrNull() ?: return body
+    val choices = obj.arrayOrNull("choices") ?: return body
+    var changed = false
+    for (item in choices) {
+        val choice = item.takeIf { it.isJsonObject }?.asJsonObject ?: continue
+        val message = choice.objOrNull("message") ?: continue
+        val content = message.stringOrNull("content") ?: continue
+        if (content.isEmpty()) continue
+        val (think, text) = ThinkTag.split(content)
+        if (think.isEmpty() && text == content) continue
+        changed = true
+        if (text.isEmpty() && think.isNotEmpty()) {
+            message.remove("content")
+        } else {
+            message.addProperty("content", text)
+        }
+        if (think.isNotEmpty()) {
+            val prev = message.stringOrNull("reasoning_content").orEmpty()
+            message.addProperty("reasoning_content", prev + think)
+        }
+    }
+    return if (changed) obj.toString() else body
+}
+
 internal fun prepareCodeBuddyBody(src: String): String = prepareCodeBuddyRequest(src).body
 
 /** 归一化后的请求体 + 工具名还原表（空表 = 无需还原，响应可原样透传）。 */

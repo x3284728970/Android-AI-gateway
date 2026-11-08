@@ -1,5 +1,7 @@
 package dev.aigw.core.provider.codebuddy
 
+import dev.aigw.core.provider.ThinkTag
+
 import com.google.gson.JsonArray
 import com.google.gson.JsonElement
 import com.google.gson.JsonObject
@@ -7,6 +9,7 @@ import com.google.gson.JsonParser
 import com.google.gson.JsonPrimitive
 import dev.aigw.core.util.arrayOrNull
 import dev.aigw.core.util.objOrNull
+import dev.aigw.core.util.stringOrNull
 import java.io.InputStream
 
 /**
@@ -280,6 +283,7 @@ private fun rewriteToolCallNames(obj: JsonObject, restore: Map<String, String>):
 internal class ToolNameRestoringStream(
     source: InputStream,
     private val restore: Map<String, String>,
+    private val thinkTag: ThinkTag? = null,
 ) : InputStream() {
     private val reader = source.bufferedReader(Charsets.UTF_8)
     private var buffer = ByteArray(0)
@@ -323,6 +327,42 @@ internal class ToolNameRestoringStream(
         val payload = line.removePrefix("data:").trim()
         if (payload.isEmpty() || payload == "[DONE]") return line + "\n"
         val restored = restoreToolNames(payload, restore)
-        return if (restored == payload) line + "\n" else "data: $restored\n"
+        // 上游 reasoning parser 偶发把整段 CoT 当 content 下发（usage.reasoning_tokens=0，
+        // 正文首尾带 <think:SUF> 控制token）：在 delta.content 上做跨片拆分，
+        // 思考进 reasoning_content，别把控制 token 当正文发出去。
+        val cleaned = if (thinkTag != null) splitThinkInFrame(restored, thinkTag!!) else restored
+        return if (cleaned == payload) line + "\n" else "data: $cleaned\n"
     }
+}
+
+/**
+ * 把一帧 OpenAI chunk 里 `choices[].delta.content` 的内联 `<think:SUF>` 摘出来。
+ *
+ * 思考片段并进同帧的 `reasoning_content`（没有就新建），正文留在 content。
+ * 其它字段原样保留；帧里没有 content 时不做任何事。
+ */
+internal fun splitThinkInFrame(frame: String, tag: ThinkTag): String {
+    val obj = runCatching { JsonParser.parseString(frame).asJsonObject }.getOrNull() ?: return frame
+    val choices = obj.arrayOrNull("choices") ?: return frame
+    var changed = false
+    for (item in choices) {
+        val choice = item.takeIf { it.isJsonObject }?.asJsonObject ?: continue
+        val delta = choice.objOrNull("delta") ?: continue
+        val content = delta.stringOrNull("content") ?: continue
+        if (content.isEmpty()) continue
+        val (think, body) = tag.feed(content)
+        if (think.isEmpty() && body == content) continue
+        changed = true
+        if (body.isEmpty() && think.isNotEmpty()) {
+            delta.remove("content")
+        } else {
+            delta.addProperty("content", body)
+        }
+        if (think.isNotEmpty()) {
+            val prev = delta.stringOrNull("reasoning_content").orEmpty()
+            delta.addProperty("reasoning_content", prev + think)
+        }
+    }
+    if (!changed) return frame
+    return obj.toString()
 }
