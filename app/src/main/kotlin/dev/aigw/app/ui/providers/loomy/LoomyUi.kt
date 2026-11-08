@@ -1,12 +1,15 @@
 package dev.aigw.app.ui.providers.loomy
 
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Sms
 import androidx.compose.material3.Button
 import androidx.compose.material3.Icon as MaterialIcon
@@ -23,10 +26,12 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import com.google.gson.JsonObject
 import kotlinx.coroutines.delay
+import dev.aigw.app.ui.ChoiceChip
 import dev.aigw.app.ui.OutlineActionButton
 import dev.aigw.app.ui.SectionCard
 import dev.aigw.app.ui.SectionLabel
@@ -34,6 +39,7 @@ import dev.aigw.app.ui.providers.ProviderUi
 import dev.aigw.app.ui.providers.ProviderUiActions
 import dev.aigw.core.pool.AccountStatus
 import dev.aigw.core.provider.ACTION_TASKS
+import dev.aigw.core.provider.ProviderTask
 import dev.aigw.core.provider.loomy.LoomyProvider
 
 object LoomyUi : ProviderUi {
@@ -204,6 +210,100 @@ object LoomyUi : ProviderUi {
 
             OutlineActionButton("一键完成新手任务") {
                 actions.onAction(id, status.uid, ACTION_TASKS, JsonObject())
+            }
+
+            TaskListSection(status, actions)
+        }
+    }
+
+    /**
+     * 新手任务明细：拉取该账号的任务清单，逐条展示完成状态与积分。
+     *
+     * 「一键完成新手任务」是盲跑的（提交前只知道哪些没完成），这里把清单摊开：
+     * 哪些做完了、哪些还没做、每条值多少积分，一眼看得见。单条的「完成」只提交这一条。
+     */
+    @Composable
+    private fun TaskListSection(status: AccountStatus, actions: ProviderUiActions) {
+        val view = actions.taskListOf(id, status.uid)
+        // 进入账号块时若无缓存则拉一次；换账号重拉
+        LaunchedEffect(status.uid) {
+            if (view == null) actions.onLoadTaskList(id, status.uid)
+        }
+
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            SectionLabel("新手任务")
+            MaterialIcon(
+                imageVector = Icons.Filled.Refresh,
+                contentDescription = "刷新任务列表",
+                tint = MaterialTheme.colorScheme.primary,
+                modifier = Modifier
+                    .clickable { actions.onLoadTaskList(id, status.uid) }
+                    .padding(start = 8.dp, top = 2.dp, bottom = 2.dp, end = 2.dp),
+            )
+        }
+
+        when {
+            view == null -> Text(
+                text = "正在加载任务列表…",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            view.error.isNotEmpty() && view.tasks.isEmpty() -> Text(
+                text = "加载任务失败：${view.error}",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+            )
+            view.tasks.isEmpty() -> Text(
+                text = "上游没有返回任务",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            else -> {
+                val done = view.tasks.count { it.completed }
+                val earned = view.tasks.filter { it.completed }.sumOf { it.rewardCredit }
+                Text(
+                    text = "共 ${view.tasks.size} 个 · 已完成 $done 个 · 已得 $earned 积分",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                view.tasks.forEach { task -> TaskRow(task, status.uid, actions) }
+            }
+        }
+    }
+
+    @Composable
+    private fun TaskRow(task: ProviderTask, uid: String, actions: ProviderUiActions) {
+        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = task.title,
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.weight(1f),
+                )
+                Text(
+                    text = if (task.completed) "已完成" else "未完成",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = if (task.completed) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            if (task.rewardCredit > 0) {
+                Text(
+                    text = "奖励 ${task.rewardCredit} 积分",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            if (!task.completed) {
+                // 只提交这一条；任务对应真实动作，服务端会校验，失败时上游原话会透出来
+                ChoiceChip("完成", false) {
+                    actions.onAction(
+                        id,
+                        uid,
+                        LoomyProvider.ACTION_COMPLETE_TASK,
+                        JsonObject().apply { addProperty("key", task.code) },
+                    )
+                }
             }
         }
     }

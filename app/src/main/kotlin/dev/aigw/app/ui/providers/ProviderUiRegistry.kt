@@ -2,6 +2,7 @@ package dev.aigw.app.ui.providers
 
 import java.util.concurrent.ConcurrentHashMap
 import dev.aigw.app.ui.providers.antigravity.AntigravityUi
+import dev.aigw.app.ui.providers.chatgpt.ChatGPTUi
 import dev.aigw.app.ui.providers.codebuddy.CodeBuddyUi
 import dev.aigw.app.ui.providers.custom.CustomUi
 import dev.aigw.app.ui.providers.dumate.DumateUi
@@ -28,6 +29,7 @@ object ProviderUiRegistry {
         TodayUi,
         CodeBuddyUi,
         AntigravityUi,
+        ChatGPTUi,
         RaccoonUi,
         QoderUi,
         QwenUi,

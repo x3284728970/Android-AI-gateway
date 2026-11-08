@@ -45,6 +45,7 @@ class BatchActionConcurrencyTest {
         override val id: String = "batch",
         private val failUids: Set<String> = emptySet(),
         private val throwUids: Set<String> = emptySet(),
+        private val unsupportedUids: Set<String> = emptySet(),
     ) : Provider {
         override val displayName = "批量测试"
         override val authKind = AuthKind.NONE
@@ -87,6 +88,7 @@ class BatchActionConcurrencyTest {
             try {
                 actionGate?.await(5, TimeUnit.SECONDS)
                 if (account.uid in throwUids) throw RuntimeException("上游炸了")
+                if (account.uid in unsupportedUids) return ProviderActionResult.unsupported("tasks")
                 if (account.uid in failUids) return ProviderActionResult.failure("签到被拒")
                 return ProviderActionResult.success("签到成功")
             } finally {
@@ -228,5 +230,19 @@ class BatchActionConcurrencyTest {
         assertEquals(setOf(1, 2, 3), progress.map { it.done }.toSet(), "已完成数应从 1 递增到 N")
         assertTrue(progress.all { it.total == 3 })
         assertTrue(progress.all { it.providerId == "batch" && it.nickname.isNotEmpty() })
+    }
+
+    @Test
+    fun `供应商不支持的动作不计入失败`() {
+        // 「该供应商不支持」是选目标时就应该排掉的，不该出现在失败面板里刷屏
+        val provider = BatchProvider(unsupportedUids = setOf("u2"))
+        val engine = engineWith(provider)
+        (1..3).forEach { engine.pool.upsert(ProviderAccount("batch", "u$it", "账号$it", "{}")) }
+        provider.expectedActions = 3
+
+        val results = engine.performActionAll(targets("u1", "u2", "u3"), "tasks")
+        assertEquals(3, results.size)
+        assertTrue(results.all { it.ok }, "不支持不能算失败：${results.filter { !it.ok }}")
+        assertTrue(results.none { it.message.contains("不支持") }, "不应把不支持文案带回界面")
     }
 }

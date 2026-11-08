@@ -46,6 +46,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import dev.aigw.app.ui.theme.DeepInk
 import dev.aigw.app.ui.theme.LocalAppColors
 import dev.aigw.app.ui.theme.ThemeMode
 import dev.aigw.app.ui.theme.formatHex
@@ -368,7 +369,7 @@ private fun HueWheel(color: Color, onPick: (Color) -> Unit) {
             center.y + (dist * sin(angleRad)).toFloat(),
         )
         drawCircle(Color.White, thumbR, thumb)
-        drawCircle(Color(0xFF0D0D0D), thumbR, thumb, style = Stroke(width = 2.dp.toPx()))
+        drawCircle(DeepInk, thumbR, thumb, style = Stroke(width = 2.dp.toPx()))
         drawCircle(color, thumbR * 0.45f, thumb)
     }
 }

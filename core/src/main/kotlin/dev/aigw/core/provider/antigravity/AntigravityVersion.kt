@@ -21,8 +21,6 @@ internal object AntigravityVersion {
     private const val MANIFEST_URL =
         "https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/manifest/latest-arm64-mac.yml"
 
-    private const val PLATFORM = "darwin/arm64"
-
     /** 兜底版本：必须 ≥ 上游的下限 2.23.0，否则新模型会被直接拒绝。 */
     const val FALLBACK_VERSION = "2.23.0"
 
@@ -40,10 +38,6 @@ internal object AntigravityVersion {
         cachedHub.set(next to nowMillis)
         return next
     }
-
-    /** 完整 UA（对话、模型清单等运行时请求使用）。 */
-    fun userAgent(nowMillis: Long = System.currentTimeMillis()): String =
-        "antigravity/hub/${current(nowMillis)} $PLATFORM"
 
     /** 解析清单里的 `version:`；失败返回 null（调用方用兜底值）。 */
     internal fun parseManifest(text: String): String? =

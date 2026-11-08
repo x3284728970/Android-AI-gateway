@@ -99,6 +99,24 @@ class TraeErrorTextTest {
     }
 
     @Test
+    fun `签到失败提示带上游业务码便于定性`() {
+        val e = TraeHttpException(200, TraeErrorKind.CLIENT, """{"code":9102,"message":"活动暂不可用"}""", 9102L)
+        assertEquals("活动暂不可用（code=9102）", traeErrorMessage(e))
+    }
+
+    @Test
+    fun `活动暂不可用码给出活动侧原因的说明`() {
+        val e = TraeHttpException(200, TraeErrorKind.CLIENT, """{"code":9090,"message":"活动暂不可用"}""", 9090L)
+        assertEquals("签到活动暂不可用（活动侧原因），稍后再试", traeErrorMessage(e))
+    }
+
+    @Test
+    fun `没有业务码时不追加 code`() {
+        val e = TraeHttpException(500, TraeErrorKind.SERVER, "")
+        assertFalse(traeErrorMessage(e).contains("code="))
+    }
+
+    @Test
     fun `调试信息仍完整保留在 debugSummary 与字段里`() {
         val body = """{"code":123,"message":"活动暂不可用"}"""
         val e = TraeHttpException(200, TraeErrorKind.CLIENT, body, 123L)

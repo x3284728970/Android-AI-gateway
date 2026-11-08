@@ -69,6 +69,14 @@ data class QuotaPack(
 )
 
 /**
+ * 用「音频对话模型」代做转写的供应商。
+ *
+ * 与有原生 `/audio/transcriptions` 端点的供应商区分：后者的结果是真正的语音识别，
+ * 前者只能让对话模型听懂录音后复述，长音频会漏字。语音端点的候选排序需要这个区分。
+ */
+interface ConversationalTranscriber
+
+/**
  * 一个上游供应商。
  *
  * 抽象边界刻意定在「OpenAI 请求体 → OpenAI 格式响应」：[openChat] 接收标准 OpenAI 请求体，
@@ -107,20 +115,44 @@ interface Provider {
     /** 发起一次对话。 */
     fun openChat(account: ProviderAccount, openAiBody: String): ChatCall
 
+    /**
+     * 是否实现 `/v1/images/generations`。
+     *
+     * 声明为 true 的 provider 才能被图像端点路由到；网关只在支持者之间做 Failover，
+     * 否则会把没有任何图像能力的供应商也算进候选，白白失败一轮。
+     */
+    val supportsImageGeneration: Boolean get() = false
+
+    /** 是否实现 `/v1/audio/transcriptions`（同上，用于语音端点的候选过滤）。 */
+    val supportsAudioTranscription: Boolean get() = false
+
+    /**
+     * 生成图片。只有 [supportsImageGeneration] 为 true 时才会被网关调用。
+     *
+     * 与 [openChat] 同一套边界：入参已是网关解析好的语义对象，上游私有协议的双向转换
+     * 封在实现内部；失败一律走 [MediaCall.Failure]，由网关按 [classify] 决定换号还是终止。
+     */
+    fun generateImage(account: ProviderAccount, request: ImageGenerationRequest): MediaCall<ImageGenerationResult> =
+        MediaCall.Failure(501, "供应商 $displayName 不支持图片生成")
+
+    /** 语音转写；[supportsAudioTranscription] 为 false 时不会被调用。 */
+    fun transcribeAudio(account: ProviderAccount, request: AudioTranscriptionRequest): MediaCall<AudioTranscriptionResult> =
+        MediaCall.Failure(501, "供应商 $displayName 不支持语音转写")
+
     /** 预刷新凭证；返回新账号表示 token 发生轮换（调用方需原子写回）。 */
     fun refreshAccount(account: ProviderAccount, skewSeconds: Long): ProviderAccount? = null
-
-    /** 统一错误分类，供调度层决定重试与换号策略。 */
-    fun classify(status: Int, body: String): UpstreamError
 
     /**
      * 修正历史遗留的账号标识（uid 口径变过时自愈）；null 表示无需迁移。
      *
-     * 引擎启动后会逐账号问一次：返回的账号若 uid 变了，就按新 uid 重新登记、删掉旧条目，
-     * 凭证与账号状态都保留。实现方只在**能确定**旧值确实是旧口径产物时才返回，
-     * 拿不准就返回 null——宁可留一条等用户手动处理的旧账号，也不去动用户的凭证。
+     * 引擎启动后会给每个账号问一次：返回的账号若 uid 变了，就按新 uid 重新登记、删掉旧条目，
+     * 凭证与账号状态都保留。实现方只在**能确定**旧值确实是旧口径产物时才返回，拿不准就返回 null——
+     * 宁可留一条等用户手动处理的旧账号，也不去动用户的凭证。
      */
     fun migrateAccount(account: ProviderAccount): ProviderAccount? = null
+
+    /** 统一错误分类，供调度层决定重试与换号策略。 */
+    fun classify(status: Int, body: String): UpstreamError
 
     /** 账号额度/积分；无此能力返回 null。 */
     fun creditInfo(account: ProviderAccount): CreditInfo? = null
@@ -131,8 +163,9 @@ interface Provider {
     /**
      * 成长任务明细（可选）；不支持任务中心的 provider 返回 null。
      *
-     * 与 [performAction] 的 `ACTION_TASKS` 不同：这里只**读取**任务列表与完成度，
-     * 不发任何写操作，供 UI 展示「有哪些任务、哪些做了、哪些没做」。
+     * 与 [performAction] 的 `ACTION_TASKS` 不同：这里以读取任务列表与完成度为主，
+     * 但实现可以在读取时补齐已达标奖励（如 WorkBuddy 自动领取），因此**可能包含写操作**，
+     * 供 UI 展示「有哪些任务、哪些做了、哪些没做」。
      */
     fun taskList(account: ProviderAccount): ProviderTaskListView? = null
 
@@ -154,6 +187,15 @@ interface Provider {
     /** provider 专属动作（签到、兑换码等）。默认不支持。 */
     fun performAction(account: ProviderAccount, action: String, payload: JsonObject): ProviderActionResult =
         ProviderActionResult.unsupported(action)
+
+    /**
+     * 这个账号是否适用该动作。默认适用。
+     *
+     * 用于批量动作选目标：区域型供应商的**国际版本来就没有签到/成长中心**，
+     * 应该在选目标时就把它排掉，而不是批量跑完了才逐个报「国际版没有⋯」——
+     * 那种报错既无用又刷屏。
+     */
+    fun supportsAction(account: ProviderAccount, action: String): Boolean = true
 
     /** 粘贴 JSON 凭证导入；不支持则返回 null。 */
     fun importCredentials(raw: String): ProviderAccount? = null

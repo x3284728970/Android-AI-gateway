@@ -36,15 +36,19 @@ fun CreditCenterScreen(state: AppUiState, onOpen: (String) -> Unit, onBack: () -
             return@PageScaffold
         }
 
-        for (info in providers) {
+        for ((index, info) in providers.withIndex()) {
             val accounts = state.accountsOf(info.id)
             val known = accounts.filter { it.creditsKnown }
-            SectionCard(modifier = Modifier.clickable { onOpen(info.id) }) {
+            SectionCard(
+                enterIndex = index,
+                pressable = true,
+                modifier = Modifier.clickable { onOpen(info.id) },
+            ) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Column(Modifier.weight(1f)) {
+                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(5.dp)) {
                         Text(
                             text = info.displayName,
                             style = MaterialTheme.typography.titleMedium,
@@ -55,6 +59,12 @@ fun CreditCenterScreen(state: AppUiState, onOpen: (String) -> Unit, onBack: () -
                                 if (known.isEmpty()) "—" else known.sumOf { it.credits }.toString(),
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        // 可用账号占比：纯数字看不出「这个供应商到底健不健康」，加一条细条一眼可扫
+                        ThinRatioBar(
+                            fraction = if (accounts.isEmpty()) null else accounts.count { it.usable }.toFloat() / accounts.size,
+                            color = if (accounts.any { !it.usable }) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.tertiary,
+                            modifier = Modifier.fillMaxWidth(),
                         )
                     }
                     Icon(

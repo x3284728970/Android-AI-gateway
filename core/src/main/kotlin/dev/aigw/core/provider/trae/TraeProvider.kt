@@ -241,7 +241,7 @@ class TraeProvider(
 
     override fun refreshAccount(account: ProviderAccount, skewSeconds: Long): ProviderAccount? {
         val trae = parseOrNull(account) ?: return null
-        val refreshed = authClient(regionOfAccount(account)).refreshIfNeeded(trae, skewSeconds) ?: return null
+        val refreshed = authClientSingleton.refreshIfNeeded(trae, skewSeconds) ?: return null
         return toProviderAccount(refreshed)
     }
 
@@ -433,13 +433,17 @@ class TraeProvider(
         }
     }
 
+    /** 签到只对国内版存在：国际版没有签到制度（前端 JS 里 checkin 零命中），选目标时先排掉。 */
+    override fun supportsAction(account: ProviderAccount, action: String): Boolean =
+        action != ACTION_CHECKIN || regionOfAccount(account) != TraeRegion.INTL
+
     override fun performAction(
         account: ProviderAccount,
         action: String,
         payload: JsonObject,
     ): ProviderActionResult = when (action) {
         ACTION_CHECKIN -> {
-            // 国际版没有签到制度（前端 JS 里 checkin 零命中）
+            // 国际版没有签到制度（前端 JS 里 checkin 零命中）；正常由 supportsAction 拦下
             if (regionOfAccount(account) == TraeRegion.INTL) {
                 ProviderActionResult.failure("国际版没有签到制度")
             } else {
@@ -477,6 +481,8 @@ class TraeProvider(
         return try {
             val status = checkinClient(regionOfAccount(account), trae.userRegion).status(trae)
             if (status.checkedIn) return ProviderActionResult.success("今日已签到")
+            // 上游明确说活动未开启就别发 claim：拿了也是「活动暂不可用」(9090)，用户看不出所以然
+            if (status.enabled == false) return ProviderActionResult.failure("签到活动未开启")
             val outcome = claimWithRetry(trae)
             if (outcome == ClaimOutcome.ALREADY_CHECKED_IN) {
                 ProviderActionResult.success("今日已签到")
@@ -641,7 +647,13 @@ internal fun ensureDeviceIds(account: TraeAccount): TraeAccount {
 internal fun traeErrorMessage(e: TraeHttpException): String = when (e.upstreamCode) {
     9074L -> "签到被拒：设备指纹未通过校验，去账号详情点「重新生成」后重试"
     4001L -> "模型或客户端版本不被上游接受（可在供应商设置里上调版本号）"
-    else -> e.message ?: "上游错误"
+    // 9090 是上游活动发放链路的「活动暂不可用」码（另一条链路对应 9069）：不是请求错，是活动侧当下领不到
+    9090L -> "签到活动暂不可用（活动侧原因），稍后再试"
+    else -> {
+        // 上游 message 往往很含糊（如「活动暂不可用」），把它对应的业务码一并给出才能定性
+        val base = e.message ?: "上游错误"
+        if (e.upstreamCode != 0L) "$base（code=${e.upstreamCode}）" else base
+    }
 }
 
 internal fun TraeErrorKind.toErrorKind(): ErrorKind = when (this) {

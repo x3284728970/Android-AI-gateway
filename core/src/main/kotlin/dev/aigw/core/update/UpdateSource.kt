@@ -56,16 +56,25 @@ data class ReleaseInfo(
     val apkSize: Long,
 ) {
     /** 与 [local] 逐段比较；远端更大返回 true。 */
-    fun isNewerThan(local: String): Boolean {
-        val remote = version.split('.', '-').mapNotNull { it.toIntOrNull() }
-        val installed = local.split('.', '-').mapNotNull { it.toIntOrNull() }
-        for (i in 0 until maxOf(remote.size, installed.size)) {
-            val a = remote.getOrElse(i) { 0 }
-            val b = installed.getOrElse(i) { 0 }
-            if (a != b) return a > b
-        }
-        return false
+    fun isNewerThan(local: String): Boolean = isNewerVersion(version, local)
+}
+
+/**
+ * 逐段比较版本号：[remote] 比 [local] 新则返回 true。
+ *
+ * 按 `.`/`-` 切段后取数字段逐位比较，缺位补 0（`2.13` 与 `2.13.0` 视为相同），
+ * 非数字段直接丢弃（如 `2.14.0-beta` 里的 beta）。app 与 core 共用这一份，
+ * 不要在两端各写一遍。[ReleaseInfo.isNewerThan] 也走它。
+ */
+fun isNewerVersion(remote: String, local: String): Boolean {
+    val r = remote.split('.', '-').mapNotNull { it.toIntOrNull() }
+    val l = local.split('.', '-').mapNotNull { it.toIntOrNull() }
+    for (i in 0 until maxOf(r.size, l.size)) {
+        val a = r.getOrElse(i) { 0 }
+        val b = l.getOrElse(i) { 0 }
+        if (a != b) return a > b
     }
+    return false
 }
 
 /**

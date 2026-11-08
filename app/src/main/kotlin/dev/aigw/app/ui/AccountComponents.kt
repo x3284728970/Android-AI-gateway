@@ -10,7 +10,12 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
@@ -56,10 +61,34 @@ fun AccountTitleColumn(
 }
 
 /**
- * 账号优先级控制：`优先` 徽章 + ↑↓ 调整顺序。
+ * 账号卡片头部标题行：左侧账号信息（[AccountTitleColumn]），右侧挂接操作控件（默认开关或展开图标）。
+ */
+@Composable
+fun AccountTitleRow(
+    account: AccountStatus,
+    modifier: Modifier = Modifier,
+    trailing: @Composable () -> Unit,
+) {
+    Row(
+        modifier = modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        AccountTitleColumn(
+            account = account,
+            modifier = Modifier.weight(1f),
+        )
+        trailing()
+    }
+}
+
+/**
+ * 账号优先级箭头（↑/↓）：绑 [ProviderUiActions.onMoveAccountPriority]。
  *
- * 优先级是「手动覆盖」：只有用户显式调过（priority > 0）才显示徽章，
- * 默认 0 的账号按余额排队，界面上不制造噪音。
+ * 排在前面的先用，同级仍按余额（见 AccountPool.pick）。被手动提到默认位置之上的账号额外标一枚「优先」，
+ * 否则用户看不出哪些号是手动提上来的。
+ *
+ * 判据用 [AccountStatus.raised] 而不是 priority：↑/↓ 是交换两个账号的优先级，
+ * 退回原顺序时高值会跑到另一个账号身上，直接看 priority 会让标记带着跑。
  */
 @Composable
 fun AccountPriorityArrows(
@@ -69,7 +98,7 @@ fun AccountPriorityArrows(
     modifier: Modifier = Modifier,
 ) {
     Row(modifier, verticalAlignment = Alignment.CenterVertically) {
-        if (account.priority > 0) {
+        if (account.raised) {
             Box(
                 modifier = Modifier
                     .clip(CircleShape)
@@ -107,27 +136,6 @@ fun AccountPriorityArrows(
 }
 
 /**
- * 账号卡片头部标题行：左侧账号信息（[AccountTitleColumn]），右侧挂接操作控件（默认开关或展开图标）。
- */
-@Composable
-fun AccountTitleRow(
-    account: AccountStatus,
-    modifier: Modifier = Modifier,
-    trailing: @Composable () -> Unit,
-) {
-    Row(
-        modifier = modifier.fillMaxWidth(),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        AccountTitleColumn(
-            account = account,
-            modifier = Modifier.weight(1f),
-        )
-        trailing()
-    }
-}
-
-/**
  * 账号启用/停用开关：绑定 [ProviderUiActions.onToggleAccount]。
  */
 @Composable
@@ -160,7 +168,7 @@ fun AccountDeleteChipRow(
         ChoiceChip(
             text = "删除账号",
             selected = false,
-            // 删除是不可恢复的：这一步只开确认框，真正的删除在对话框的确认按钮里
+            // 删除不可恢复：这一步只开确认框，真正的删除在对话框的确认按钮里
             onClick = { confirm = true },
         )
     }

@@ -1,6 +1,5 @@
 package dev.aigw.app.ui
 
-import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedContentTransitionScope
 import androidx.compose.animation.ContentTransform
 import androidx.compose.animation.core.FastOutSlowInEasing
@@ -16,24 +15,19 @@ import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.keyframes
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyListState
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.State
 import androidx.compose.runtime.derivedStateOf
-import androidx.compose.foundation.gestures.awaitEachGesture
-import androidx.compose.foundation.gestures.awaitFirstDown
-import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
@@ -43,7 +37,6 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
@@ -329,7 +322,10 @@ fun Modifier.scrollFade(
 }
 
 /**
- * 呼吸指示灯：陶土色圆点做 3s 周期的缩放 + 亮度呼吸。
+ * 呼吸指示灯：圆点做 3s 周期的缩放 + 亮度呼吸；[haloSize] 非空时额外画一圈柔光外晕
+ * （占位取 [haloSize]，核心仍是 [size] 大小）。
+ *
+ * [breathing] 为 false 时不动画、无外晕，仅画一个静态圆点。
  *
  * 时序借鉴 open-claude-ui（MIT, Caho1）逆向的 `dframe-clay-breathe`
  * （scale 0.86→1、brightness 0.96→1.06、3.0s ease-in-out）。
@@ -338,7 +334,22 @@ fun Modifier.scrollFade(
 fun Modifier.breathingDot(
     color: Color,
     size: Dp = 8.dp,
+    breathing: Boolean = true,
+    haloSize: Dp? = null,
 ): Modifier {
+    // 外晕只在显式给出时占位：不传即维持原来的纯圆点尺寸，不改变已有调用方的布局
+    val boxSize = haloSize ?: size
+    if (!breathing) {
+        return this
+            .size(boxSize)
+            .drawBehind {
+                val center = Offset(this.size.width / 2f, this.size.height / 2f)
+                if (haloSize != null) {
+                    drawCircle(color = color.copy(alpha = 0.22f), radius = (boxSize / 2).toPx(), center = center)
+                }
+                drawCircle(color = color, radius = (size / 2).toPx(), center = center)
+            }
+    }
     val transition = rememberInfiniteTransition(label = "breathe")
     val scale by transition.animateFloat(
         initialValue = 0.86f,
@@ -358,57 +369,27 @@ fun Modifier.breathingDot(
         ),
         label = "breatheAlpha",
     )
+    val actualHalo = boxSize
     return this
-        .size(size)
+        .size(actualHalo)
         .graphicsLayer {
             scaleX = scale
             scaleY = scale
             this.alpha = alpha
         }
-        .clip(CircleShape)
-        .background(color)
-}
-
-/**
- * 三点波浪：三个点依次起伏，用于「正在请求 / 正在加载」。
- *
- * 时序借鉴 open-claude-ui（MIT, Caho1）的思考三点波浪：1.2s 一轮、每点错开 160ms、纵向位移 6px。
- */
-@Composable
-fun TypingDots(
-    color: Color,
-    modifier: Modifier = Modifier,
-    dotSize: Dp = 4.dp,
-) {
-    val transition = rememberInfiniteTransition(label = "typingDots")
-    Row(
-        modifier = modifier,
-        horizontalArrangement = Arrangement.spacedBy(dotSize),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        repeat(3) { index ->
-            val lift by transition.animateFloat(
-                initialValue = 0f,
-                targetValue = 1f,
-                animationSpec = infiniteRepeatable(
-                    animation = keyframes {
-                        durationMillis = 1200
-                        0f at (index * 160)
-                        0.5f at (index * 160 + 300)
-                        1f at (index * 160 + 600)
-                        1f at 1200
-                    },
-                    repeatMode = RepeatMode.Restart,
-                ),
-                label = "dot$index",
-            )
-            Box(
-                Modifier
-                    .size(dotSize)
-                    .graphicsLayer { translationY = -(lift * 6f) }
-                    .clip(CircleShape)
-                    .background(color.copy(alpha = 0.45f + 0.55f * lift)),
+        .drawBehind {
+            val center = Offset(this.size.width / 2f, this.size.height / 2f)
+            if (haloSize != null) {
+                drawCircle(
+                    color = color.copy(alpha = 0.22f),
+                    radius = (actualHalo / 2).toPx(),
+                    center = center,
+                )
+            }
+            drawCircle(
+                color = color,
+                radius = (size / 2).toPx(),
+                center = center,
             )
         }
-    }
 }

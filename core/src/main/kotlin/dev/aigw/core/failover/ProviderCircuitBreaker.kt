@@ -63,11 +63,4 @@ class ProviderCircuitBreaker(
     }
 
     fun currentState(): BreakerState = state.get()
-
-    fun reset() {
-        state.set(BreakerState.CLOSED)
-        failureCount.set(0)
-        halfOpenSuccessCount.set(0)
-        lastStateChangeTime.set(nowMillis())
-    }
 }

@@ -1,8 +1,10 @@
 package dev.aigw.core.gateway
 
 import com.google.gson.JsonObject
+import dev.aigw.core.pool.AccountImportResult
 import dev.aigw.core.pool.AccountPool
 import dev.aigw.core.pool.AccountStatus
+import dev.aigw.core.pool.AccountTransfer
 import dev.aigw.core.pool.PoolSummary
 import dev.aigw.core.provider.ACTION_CHECKIN
 import dev.aigw.core.provider.AuthKind
@@ -32,6 +34,7 @@ import dev.aigw.core.provider.custom.CustomProvider
 import dev.aigw.core.provider.raccoon.RaccoonProvider
 import dev.aigw.core.provider.trae.TraeProvider
 import dev.aigw.core.store.KeyValueStore
+import dev.aigw.core.failover.weightedOrder
 import dev.aigw.core.usage.CallLogStore
 import dev.aigw.core.usage.RequestLog
 import dev.aigw.core.usage.StorageAudit
@@ -69,6 +72,8 @@ data class CreditRefreshResult(
     val balance: Long,
     val known: Boolean,
     val error: String,
+    /** 余额单位（[dev.aigw.core.provider.CreditUnit]）；空串等同 credits。 */
+    val unit: String = "",
 )
 
 /** 批量动作的目标账号（providerId + uid）。 */
@@ -203,12 +208,18 @@ class GatewayEngine(
     val sanitizer = dev.aigw.core.security.RequestSanitizer(nowMillis)
     val rateLimiter = dev.aigw.core.security.AccountRateLimiter(nowMillis)
 
+    /** 在途请求表（仅供状态展示：通知/界面）；不参与调度，见 [ActiveRequests]。 */
+    val activeRequests = ActiveRequests(nowMillis)
+
     @Volatile
     private var failoverSettings: dev.aigw.core.failover.ModelFailoverSettings =
         dev.aigw.core.failover.ModelFailoverSettings.fromJson(store.read(dev.aigw.core.failover.ModelFailoverSettings.STORE_KEY))
 
     private val circuitBreakers = ConcurrentHashMap<String, dev.aigw.core.failover.ProviderCircuitBreaker>()
     private val providerMetrics = ConcurrentHashMap<String, dev.aigw.core.failover.ProviderMetricsTracker>()
+
+    /** 供应商 × 模型的近期健康窗口（TTFB、P95、失败原因 Top-N），排障用。 */
+    private val healthWindow = dev.aigw.core.usage.ModelHealthWindow()
 
     /** 模型级冷却表：该 (供应商, 模型) 暂时不可用时直接跳过，换号无意义。仅内存。 */
     private val modelCooldown = dev.aigw.core.failover.ModelCooldownTracker(nowMillis)
@@ -323,6 +334,85 @@ class GatewayEngine(
     @Volatile
     private var modelExposure: ModelExposureSettings = ModelExposureSettings.load(store)
 
+    // ------------------------------------------------- 客户端密钥 / 会话亲和 / 路由组 / 改写 / 价格
+
+    /** 客户端密钥台账（与上游凭证完全分离，只管「谁能调网关」）。 */
+    val clientKeyStore = ClientKeyStore(store, nowMillis)
+
+    /** 密钥用量台账：独立于调用记录开关，清日志不会把额度「赚」回来。 */
+    val clientKeyUsage = ClientKeyUsageLedger(store, nowMillis)
+
+    /** 会话 → (供应商, 账号) 亲和表；只存内存，重启后重新学习。 */
+    val sessionAffinity = SessionAffinity(nowMillis = nowMillis)
+
+    @Volatile
+    private var routingGroups: RoutingGroupSettings =
+        RoutingGroupSettings.fromJson(store.read(RoutingGroupSettings.STORE_KEY))
+
+    @Volatile
+    private var middlewareSettings: MiddlewareSettings =
+        MiddlewareSettings.fromJson(store.read(MiddlewareSettings.STORE_KEY))
+
+    /** 由 [middlewareSettings] 构建的改写链；无任何改写时为空链（网关走零开销路径）。 */
+    @Volatile
+    private var middlewareChain: MiddlewareChain = MiddlewareChain.build(middlewareSettings)
+
+    @Volatile
+    private var pricingTable: dev.aigw.core.usage.PricingTable =
+        dev.aigw.core.usage.PricingTable.fromJson(store.read(dev.aigw.core.usage.PricingTable.STORE_KEY))
+
+    fun routingGroupSettings(): RoutingGroupSettings = routingGroups
+
+    fun updateRoutingGroups(updated: RoutingGroupSettings) {
+        routingGroups = updated
+        store.write(RoutingGroupSettings.STORE_KEY, updated.toJson().toString())
+        log("路由组已更新（共 ${updated.groups.size} 组）")
+    }
+
+    fun middlewareSettings(): MiddlewareSettings = middlewareSettings
+
+    fun middleware(): MiddlewareChain = middlewareChain
+
+    fun updateMiddlewareSettings(updated: MiddlewareSettings) {
+        middlewareSettings = updated
+        middlewareChain = MiddlewareChain.build(updated)
+        store.write(MiddlewareSettings.STORE_KEY, updated.toJson().toString())
+        log("请求改写已更新（别名 ${updated.aliases.size} 条，system 追加=${if (updated.systemPromptAppend.isNotBlank()) "有" else "无"}，清理 think 标签=${if (updated.stripThinkTags) "开" else "关"}）")
+    }
+
+    fun pricingTable(): dev.aigw.core.usage.PricingTable = pricingTable
+
+    fun updatePricingTable(updated: dev.aigw.core.usage.PricingTable) {
+        pricingTable = updated
+        store.write(dev.aigw.core.usage.PricingTable.STORE_KEY, updated.toJson().toString())
+        log("模型价格表已更新（共 ${updated.prices.size} 个模型）")
+    }
+
+    /** 账号选择策略：与路由/容错设置一起存，策略变更立即生效（选号每次实时读取）。 */
+    fun accountStrategy(): dev.aigw.core.failover.AccountStrategy = failoverSettings.accountStrategy
+
+    /**
+     * 计算一次调用的费用（微美元）。
+     *
+     * 返回 `null` 表示该模型没配价格——调用方必须显示「未定价」而不是 0 元。
+     */
+    fun costMicrosOf(
+        modelFullId: String,
+        promptTokens: Long,
+        completionTokens: Long,
+        cacheReadTokens: Long,
+        cacheWriteTokens: Long = 0L,
+    ): Long? {
+        val cost = dev.aigw.core.usage.costOf(
+            price = pricingTable.priceOf(modelFullId),
+            promptTokens = promptTokens,
+            completionTokens = completionTokens,
+            cacheReadTokens = cacheReadTokens,
+            cacheWriteTokens = cacheWriteTokens,
+        ) ?: return null
+        return dev.aigw.core.usage.toMicroUsd(cost)
+    }
+
     /** 当前正在监听的登录回调服务（同一时间只允许一个登录流程）。 */
     private var callbackServer: LoopbackCallbackServer? = null
 
@@ -408,10 +498,28 @@ class GatewayEngine(
             dev.aigw.core.failover.ProviderCircuitBreaker(providerId, config = { failoverSettings.circuitBreaker }, nowMillis = nowMillis)
         }
 
+    /**
+     * 「供应商 × 模型」级熔断器（与供应商级独立）。
+     *
+     * 用于区分「这家整体挂了」与「只是这个模型在这家不可用」：后者若计进供应商熔断，
+     * 会把该供应商其它仍可用的模型一起封掉。键为 `providerId|model`，阈值同供应商级配置。
+     */
+    fun modelBreakerOf(providerId: String, model: String): dev.aigw.core.failover.ProviderCircuitBreaker =
+        circuitBreakers.computeIfAbsent("$providerId|$model") {
+            dev.aigw.core.failover.ProviderCircuitBreaker(
+                "$providerId|$model",
+                config = { failoverSettings.circuitBreaker },
+                nowMillis = nowMillis,
+            )
+        }
+
     fun metricsOf(providerId: String): dev.aigw.core.failover.ProviderMetricsTracker =
         providerMetrics.computeIfAbsent(providerId) { dev.aigw.core.failover.ProviderMetricsTracker() }
 
     fun modelCooldownOf(): dev.aigw.core.failover.ModelCooldownTracker = modelCooldown
+
+    /** 供应商 × 模型的近期健康窗口（TTFB / P95 / 失败原因），只存内存。 */
+    fun healthWindowOf(): dev.aigw.core.usage.ModelHealthWindow = healthWindow
 
     // ------------------------------------------------------------------ 模型开放名单
 
@@ -431,8 +539,29 @@ class GatewayEngine(
     /**
      * 对外暴露的模型目录：模型页 UI 用 `modelsStreaming`（不过滤，展示全量，供勾选）；
      * HTTP `/v1/models` 用本方法（按开放名单过滤）。
+     *
+     * 路由组也会出现在这里（`group/<id>`）：组对客户端就是一个模型，
+     * 不列出来客户端就没法选它。
      */
-    fun exposedModels(): List<RoutedModel> = filterExposed(models())
+    fun exposedModels(): List<RoutedModel> = filterExposed(models()) + groupModels()
+
+    /** 把路由组投影成模型条目；能力/上下文取自组内首位成员的模型元数据。 */
+    private fun groupModels(): List<RoutedModel> = routingGroups.groups
+        .filter { it.enabled && it.members.isNotEmpty() }
+        .mapNotNull { group ->
+            val first = group.members.first()
+            val memberModel = models().firstOrNull { it.providerId == first.providerId && it.model.id == first.model }
+                ?: return@mapNotNull RoutedModel(
+                    providerId = RoutingGroupSettings.PREFIX + group.id,
+                    providerName = "路由组",
+                    model = dev.aigw.core.provider.ProviderModel(group.displayName, group.displayName),
+                )
+            RoutedModel(
+                providerId = RoutingGroupSettings.PREFIX + group.id,
+                providerName = "路由组",
+                model = memberModel.model.copy(id = group.id, name = group.displayName),
+            )
+        }
 
     // ------------------------------------------------------------------ 代理
 
@@ -517,7 +646,8 @@ class GatewayEngine(
             if (server != null) return
             val host = if (settings.exposeLan) null else "127.0.0.1"
             val created = GatewayHttpServer(this, host, settings.port)
-            created.start(0, false)
+            // 第二个参数是 socket 读超时（毫秒）：0 表示永不超时，半开连接会永久占住一个线程。
+            created.start(SOCKET_READ_TIMEOUT_MS, false)
             server = created
             log("网关已启动，监听 ${created.listeningAddress()}")
         }
@@ -697,7 +827,7 @@ class GatewayEngine(
             pool.updateCredits(providerId, uid, 0, false, reason)
             return CreditRefreshResult(providerId, uid, account.nickname, 0, false, reason)
         }
-        pool.updateCredits(providerId, uid, info.balance, info.known, info.detail)
+        pool.updateCredits(providerId, uid, info.balance, info.known, info.detail, info.unit)
         if (info.known) {
             log("额度刷新 $providerId/${account.nickname.ifEmpty { uid }}：${info.balance}（${info.detail}）")
         } else {
@@ -705,7 +835,7 @@ class GatewayEngine(
         }
         return CreditRefreshResult(
             providerId, uid, account.nickname, info.balance, info.known,
-            if (info.known) "" else info.detail,
+            if (info.known) "" else info.detail, info.unit,
         )
     }
 
@@ -735,6 +865,96 @@ class GatewayEngine(
             logWarn("拉取额度包失败（$providerId/$uid）：${e.message}")
             emptyList()
         }
+    }
+
+    // ------------------------------------------------------------------ 账号导入导出
+
+    /**
+     * 导出账号（含明文凭证）。[selection] 是 `providerId/uid` 集合，空集合表示全部。
+     *
+     * 只取当前确实在池里的账号：勾选后又被删掉的不会凭空出现在导出内容里。
+     */
+    fun exportAccounts(selection: Set<String> = emptySet()): String {
+        val all = pool.accounts()
+        val picked = if (selection.isEmpty()) all else all.filter { "${it.providerId}/${it.uid}" in selection }
+        return AccountTransfer.encode(picked.sortedWith(compareBy({ it.providerId }, { it.uid })), nowMillis())
+    }
+
+    /**
+     * 导入账号。
+     *
+     * [overwrite] 为 true 时同 (providerId, uid) 的已有账号被覆盖（凭证与昵称），否则跳过。
+     * 未注册的 providerId 不落池，单独报出来——否则会存下一个永远选不了号的死账号。
+     * [selection] 是 `providerId/uid` 集合，空集合表示导入文件里的全部账号。
+     */
+    fun importAccounts(
+        json: String,
+        overwrite: Boolean,
+        selection: Set<String> = emptySet(),
+    ): AccountImportResult {
+        val envelope = AccountTransfer.decode(json)
+        val picked = if (selection.isEmpty()) {
+            envelope.accounts
+        } else {
+            envelope.accounts.filter { "${it.providerId}/${it.uid}" in selection }
+        }
+        val added = ArrayList<String>()
+        val updated = ArrayList<String>()
+        val skipped = ArrayList<String>()
+        val unknown = ArrayList<String>()
+        for (account in picked) {
+            val key = "${account.providerId}/${account.uid}"
+            if (registry.get(account.providerId) == null) {
+                unknown.add(key)
+                continue
+            }
+            val existing = pool.account(account.providerId, account.uid)
+            when {
+                existing == null -> {
+                    pool.upsert(account)
+                    added.add(key)
+                }
+                overwrite -> {
+                    pool.upsert(account)
+                    updated.add(key)
+                }
+                else -> skipped.add(key)
+            }
+        }
+        if (added.isNotEmpty() || updated.isNotEmpty()) {
+            onLog("账号导入：新增 ${added.size}、覆盖 ${updated.size}、跳过 ${skipped.size}")
+        }
+        return AccountImportResult(added = added, updated = updated, skipped = skipped, unknownProviders = unknown)
+    }
+
+    /** 解析导出内容（只读、不落池），供导入前预览与勾选。 */
+    fun parseAccountTransfer(json: String): List<ProviderAccount> = AccountTransfer.decode(json).accounts
+
+    /**
+     * 修正历史遗留的账号标识（uid 口径变过时自愈）。启动后调用一次，幂等。
+     *
+     * 逐账号问 provider 是否需要迁移（[Provider.migrateAccount]）：uid 变了就按新 key 重新登记、
+     * 删掉旧条目，凭证与账号状态（启用开关、额度）一并跟着走。provider 未实现迁移时直接跳过。
+     *
+     * @return 实际迁移的账号数。
+     */
+    fun migrateAccounts(): Int {
+        var moved = 0
+        for (account in pool.accounts()) {
+            val provider = registry.get(account.providerId) ?: continue
+            val migrated = try {
+                provider.migrateAccount(account)
+            } catch (e: Exception) {
+                logWarn("账号标识迁移失败（${account.providerId}/${account.uid}）：${e.message}")
+                null
+            } ?: continue
+            if (migrated.uid == account.uid) continue
+            if (pool.renameAccount(account.providerId, account.uid, migrated)) {
+                onLog("账号标识已迁移：${account.providerId}/${account.uid} → ${migrated.uid}")
+                moved++
+            }
+        }
+        return moved
     }
 
     /**
@@ -824,7 +1044,16 @@ class GatewayEngine(
             val outcome = runCatching { performActionRaw(target.providerId, target.uid, action, payload) }
             val nickname = pool.account(target.providerId, target.uid)?.nickname ?: ""
             outcome.fold(
-                { BatchActionResult(target.providerId, target.uid, nickname, it.ok, it.message) },
+                { result ->
+                    // 「该供应商不支持」不是执行失败，而是选目标时就应该排掉的情况：
+                    // 计入失败面板会让用户看到一堆无意义的报错，所以单独标出来（ok = true），
+                    // 不计入失败数也不进补刷额度。
+                    if (result.unsupported) {
+                        BatchActionResult(target.providerId, target.uid, nickname, true, "")
+                    } else {
+                        BatchActionResult(target.providerId, target.uid, nickname, result.ok, result.message)
+                    }
+                },
                 { BatchActionResult(target.providerId, target.uid, nickname, false, it.message ?: "操作失败") },
             )
         }
@@ -834,6 +1063,18 @@ class GatewayEngine(
         val succeeded = results.filter { it.ok }.map { BatchTarget(it.providerId, it.uid) }
         if (succeeded.isNotEmpty()) refreshCreditsBounded(succeeded, parallelism)
         return results
+    }
+
+    /**
+     * 这个账号是否适用该批量动作（供应商自报，默认适用）。
+     *
+     * 供批量选目标时调用：区域型供应商的国际版、企业账号本就没有签到/成长中心，
+     * 应在选目标时排掉，而不是批量跑完再逐条报错。
+     */
+    fun supportsAction(providerId: String, uid: String, action: String): Boolean {
+        val provider = registry.get(providerId) ?: return false
+        val account = pool.account(providerId, uid) ?: return false
+        return provider.supportsAction(account, action)
     }
 
     /** 批量动作的底层执行：不做额度补刷，供 [performAction] 与 [performActionAll] 共用。 */
@@ -966,7 +1207,9 @@ class GatewayEngine(
             }
 
             provider is LoopbackOAuthSupport -> {
-                startCallbackServer(AntigravityProvider.CALLBACK_PORT, AntigravityProvider.CALLBACK_PATH) { url ->
+                // 回调端口/路径由 provider 自己声明：redirect_uri 是上游注册值，写死会让第二家
+                // loopback 供应商（如 ChatGPT 的 1455）永远收不到回调。
+                startCallbackServer(provider.callbackPort, provider.callbackPath) { url ->
                     val outcome = completeOAuth(providerId, url)
                     resultPage(outcome.ok, outcome.nickname.ifEmpty { outcome.uid }, outcome.error)
                 }
@@ -1118,19 +1361,13 @@ class GatewayEngine(
         return poll
     }
 
-    fun buildOAuthUrl(providerId: String): String {
-        val support = registry.get(providerId) as? LoopbackOAuthSupport
-            ?: throw IllegalStateException("该供应商不支持 OAuth 登录")
-        return support.buildAuthUrl()
-    }
-
     fun completeOAuth(providerId: String, callbackUrl: String): LoginOutcome {
         val support = registry.get(providerId) as? LoopbackOAuthSupport
             ?: return LoginOutcome(LoginState.FAILED, error = "该供应商不支持 OAuth 登录")
-        val code = dev.aigw.core.provider.queryParam(callbackUrl, "code")
-            ?: return LoginOutcome(LoginState.FAILED, error = "回调里没有 code 参数")
         return try {
-            adopt(providerId, support.exchangeCode(code), "登录")
+            // 走 completeCallback 让供应商拿到完整 URL：需要校验 state / 一次性消费 code 的
+            // 供应商（如 ChatGPT）在那一层做防重放；默认实现等价于只取 code。
+            adopt(providerId, support.completeCallback(callbackUrl), "登录")
         } catch (e: Exception) {
             logWarn("OAuth 登录失败（$providerId）：${e.message}")
             LoginOutcome(LoginState.FAILED, error = e.message ?: "登录失败")
@@ -1234,6 +1471,9 @@ class GatewayEngine(
                 continue
             }
             aggregated.addAll(chunk.models)
+            // 「没有账号」不是失败：登录前本就不该有模型，供应商自报的 error 也不该报红。
+            // 这条约定原本只靠各 Provider 自觉（历史上 ChatGPT 就违反了），在这里统一兜住。
+            if (chunk.error != null && pool.accounts(providerId).isEmpty()) continue
             chunk.error?.let { failures[chunk.providerId] = it }
         }
         return ModelsCatalog(aggregated, failures)
@@ -1367,9 +1607,25 @@ class GatewayEngine(
      * 3. 若只配置了一个供应商的账号，自动由该供应商接管所有请求；
      * 4. 其它情况落到有账号的供应商或 `defaultProvider`。
      */
-    fun resolveRoute(requested: String): Route? {
+    fun resolveRoute(requested: String, body: String = ""): Route? {
         var model = requested.trim()
         if (model.isEmpty()) return null
+
+        // 路由组：首选路由由组内首位成员决定，其余成员在 resolveCandidateRoutes 里作为备用。
+        // 放在最前面，因为组名本身就是对外模型 id，不该再进入后面的前缀/特征推断。
+        val groupId = RoutingGroupSettings.groupIdOf(model, routingGroups)
+        if (groupId != null) {
+            val group = routingGroups.find(groupId)
+            if (group != null) {
+                val ordered = RoutingGroupResolver.orderMembers(group, ruleContextOf(body))
+                val first = ordered.firstOrNull()
+                if (first != null && registry.get(first.providerId) != null &&
+                    providerSettings(first.providerId).enabled
+                ) {
+                    return Route(first.providerId, first.model)
+                }
+            }
+        }
 
         // 剥离可能存在的 "models/" 前缀（Google/Gemini 客户端与 SDK 的常见标准命名）
         if (model.startsWith("models/", ignoreCase = true)) {
@@ -1445,25 +1701,100 @@ class GatewayEngine(
 
     /**
      * 在指定供应商中选号；[region] 非空时只选属于该区域且处于可用状态的账号中余额最高者。
+     *
+     * 有并发闸门时优先选还有在途余量的账号（[ConcurrencyGate.hasCapacity]）：闸门按账号串行，
+     * 若选号不感知在途，多个请求会全挤在优先级最高的那一个账号上排队，其它账号完全闲着。
+     * 全部账号都满载时仍返回首选账号，由调用方决定是排队还是快速拒绝。
      */
-    fun pickAccount(providerId: String, exclude: Set<String> = emptySet(), region: String? = null): ProviderAccount? {
-        if (region == null) return pool.pick(providerId, exclude)
-        val regionAware = registry.get(providerId) as? dev.aigw.core.provider.RegionAwareSupport ?: return pool.pick(providerId, exclude)
+    fun pickAccount(
+        providerId: String,
+        exclude: Set<String> = emptySet(),
+        region: String? = null,
+        /** 会话键（亲和命中时优先用上一轮答过它的账号）。 */
+        sessionKey: String = "",
+    ): ProviderAccount? {
+        // 亲和优先：命中时直接复用该账号，但**仍然走完整过滤**——账号可能已失效/被禁用/在冷却，
+        // 那时不能因为它「曾经答过」就把请求送去撞墙。
+        if (sessionKey.isNotEmpty()) {
+            val binding = sessionAffinity.lookup(sessionKey)
+            if (binding != null && binding.providerId == providerId && binding.uid !in exclude) {
+                val account = pool.account(providerId, binding.uid)
+                if (account != null && isAccountUsable(providerId, binding.uid) && hasLoadCapacity(providerId, binding.uid)) {
+                    return account
+                }
+            }
+        }
+        val candidate = pickAccountIgnoringLoad(providerId, exclude, region) ?: return null
+        if (hasLoadCapacity(providerId, candidate.uid)) return candidate
+        return pickAccountIgnoringLoad(providerId, exclude, region, requireIdle = true) ?: candidate
+    }
+
+    /** 账号当前是否可用（未禁用、未冷却）。亲和复用前的最后一道闸。 */
+    private fun isAccountUsable(providerId: String, uid: String): Boolean =
+        pool.statuses(providerId).firstOrNull { it.uid == uid }?.usable == true &&
+            !pool.isCooling(providerId, uid)
+
+    private fun hasLoadCapacity(providerId: String, uid: String): Boolean =
+        concurrencyGate.hasCapacity("$providerId/$uid")
+
+    /** [requireIdle] 为 true 时只在还有并发余量的账号中选号（用于满载时兜底找空闲账号）。 */
+    private fun pickAccountIgnoringLoad(
+        providerId: String,
+        exclude: Set<String>,
+        region: String?,
+        requireIdle: Boolean = false,
+    ): ProviderAccount? {
+        val idleFilter: (String) -> Boolean = { uid -> !requireIdle || hasLoadCapacity(providerId, uid) }
+        if (region == null) {
+            if (!requireIdle) return pool.pickByStrategy(providerId, accountStrategy(), exclude)
+            return pool.pickByStrategy(providerId, accountStrategy(), exclude, accountFilter = idleFilter)
+        }
+        val regionAware = registry.get(providerId) as? dev.aigw.core.provider.RegionAwareSupport
+            ?: return pickAccountIgnoringLoad(providerId, exclude, null, requireIdle)
         // 一次取状态快照（单次加锁），避免对每个账号各加一次读锁
         val statusByUid = pool.statuses(providerId).associateBy { it.uid }
-        return pool.accounts(providerId)
+        val candidates = pool.accounts(providerId)
             .filter { account -> account.uid !in exclude }
             .filter { account -> statusByUid[account.uid]?.usable == true }
             .filter { account -> regionAware.regionOf(account) == region }
-            .maxByOrNull { account -> statusByUid[account.uid]?.credits ?: 0L }
+            .filter { account -> idleFilter(account.uid) }
+            .map { account ->
+                val status = statusByUid[account.uid]
+                dev.aigw.core.failover.AccountCandidate(
+                    uid = account.uid,
+                    priority = status?.priority ?: 0,
+                    credits = status?.credits ?: 0L,
+                    creditsKnown = status?.creditsKnown ?: false,
+                )
+            }
+        val ordered = dev.aigw.core.failover.orderAccounts(candidates, accountStrategy())
+        val byUid = pool.accounts(providerId).associateBy { it.uid }
+        return ordered.firstNotNullOfOrNull { byUid[it] }
+    }
+
+    /**
+     * 从请求体构造规则上下文。
+     *
+     * 只在解析候选路由时算一次：规则只在一轮开始时决策，工具回调过程中不重新判定，
+     * 否则同一轮会在中途换模型，上游前缀缓存整段作废。
+     */
+    private fun ruleContextOf(body: String): RuleContext {
+        if (body.isEmpty()) return RuleContext(nowMillis = now())
+        return RuleContext(
+            promptTokens = RoutingGroupResolver.estimatePromptTokens(body),
+            hasImage = RoutingGroupResolver.bodyHasImage(body),
+            compactRequest = RoutingGroupResolver.isCompactRequest(body),
+            folder = RoutingGroupResolver.detectFolder(body),
+            nowMillis = now(),
+        )
     }
 
     /**
      * 解析请求模型的所有候选路由（支持同款模型跨供应商故障转移 Failover）。
      *
-     * 1. 若配置了显式多供应商优先级映射表，按优先级（priority 降序）依次尝试；
-     * 2. 否则自动回退到启发式同名/同款探测逻辑；
-     * 3. 熔断中或无可用账号的供应商会被合理标记或降级。
+     * 优先级：路由组（`group/<id>` 或裸组名）> 显式多供应商映射表 > 启发式同名/同款探测。
+     * [body] 非空时用于评估组规则的上下文（token 估算、图片、压缩、工作目录）；
+     * 为空则依赖请求体的规则条件一律不命中，只剩时段/星期类条件生效。
      */
     /**
      * 这次请求会跨供应商转移吗（首选 vs 候选）。
@@ -1476,7 +1807,22 @@ class GatewayEngine(
         return candidates.size > 1 && candidates.first().providerId != candidates[1].providerId
     }
 
-    fun resolveCandidateRoutes(requested: String): List<Route> {
+    fun resolveCandidateRoutes(requested: String, body: String = ""): List<Route> {
+        // 路由组优先：组是用户显式声明的意图，不应被启发式回退盖过
+        val groupId = RoutingGroupSettings.groupIdOf(requested, routingGroups)
+        if (groupId != null) {
+            val group = routingGroups.find(groupId)
+            if (group != null) {
+                val ordered = RoutingGroupResolver.orderMembers(group, ruleContextOf(body))
+                val routes = ordered.mapNotNull { member ->
+                    if (registry.get(member.providerId) == null) return@mapNotNull null
+                    if (!providerSettings(member.providerId).enabled) return@mapNotNull null
+                    Route(member.providerId, member.model)
+                }
+                if (routes.isNotEmpty()) return routes
+            }
+        }
+
         val primary = resolveRoute(requested) ?: return emptyList()
         // 用户显式指定了供应商（`today/xxx`）：只在这一家上跑，失败就如实报错。
         // 否则会出现这种事故：用户在 today 上试限时免费的模型，today 凭证恰好失效，
@@ -1494,9 +1840,8 @@ class GatewayEngine(
 
         if (!configuredCandidates.isNullOrEmpty()) {
             val list = ArrayList<Route>()
-            // 按 priority 降序
-            val sorted = configuredCandidates.sortedByDescending { it.priority }
-            for (c in sorted) {
+            // 先按 priority 降序，同优先级内按 weight 加权随机（见 weightedOrder）
+            for (c in weightedOrder(configuredCandidates)) {
                 if (registry.get(c.providerId) != null && providerSettings(c.providerId).enabled) {
                     list.add(Route(c.providerId, c.upstreamModel))
                 }
@@ -1655,20 +2000,6 @@ class GatewayEngine(
      * 逐账号问 provider 是否需要迁移（[Provider.migrateAccount]）：uid 变了就按新 key 重新登记、
      * 旧条目删除（凭证与状态都保留）。返回迁移条数；只在启动后的后台跑一次。
      */
-    fun migrateAccounts(): Int {
-        var moved = 0
-        for (account in pool.accounts()) {
-            val provider = registry.get(account.providerId) ?: continue
-            val migrated = runCatching { provider.migrateAccount(account) }.getOrNull() ?: continue
-            if (migrated.uid == account.uid) continue
-            pool.upsert(migrated)
-            pool.remove(account.providerId, account.uid)
-            moved++
-            log("账号标识迁移：${account.providerId} ${account.uid.take(12)}… → ${migrated.uid.take(12)}…")
-        }
-        return moved
-    }
-
     /** 存储占用明细。 */
     fun storageReport(): StorageReport = StorageAudit.audit(store)
 
@@ -1739,6 +2070,14 @@ class GatewayEngine(
 
         /** `/v1/models` 单个供应商拉取模型目录的超时（秒）：上游 READ_TIMEOUT 300s 不能无限等。 */
         const val MODELS_FETCH_TIMEOUT_SECONDS = 20L
+
+        /**
+         * 客户端连接的 socket 读超时（毫秒）。
+         *
+         * 原本传 0（永不超时），于是半开连接或卡住的客户端会永久占住一个请求线程；
+         * 60s 足够任何正常客户端把请求体发完，也远大于流式空闲心跳间隔（15s）。
+         */
+        private const val SOCKET_READ_TIMEOUT_MS = 60_000
 
         /** 区域型供应商：等待各区域目录拉取的预算（单个请求自身的读超时另算）。 */
         private const val REGIONAL_FETCH_WAIT_MS = 16_000L

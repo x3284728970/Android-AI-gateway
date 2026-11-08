@@ -31,6 +31,8 @@ fun main(args: Array<String>) {
     if (!dataDir.exists()) dataDir.mkdirs()
 
     val engine = GatewayEngine(FileKeyValueStore(dataDir), onLog = { println("[log] $it") })
+    // uid 口径变更后的自愈（如小浣熊早期把 JWT 的 iss 当 uid）：一次性命令同步跑，拿到的就是修好的账号
+    engine.migrateAccounts()
 
     when (command) {
         "serve" -> serve(engine, rest)

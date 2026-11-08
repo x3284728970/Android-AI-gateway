@@ -360,62 +360,41 @@ object OpenAiGemini {
                         })
                     }
                 }
+                // OpenAI 的音频 part（`{type:input_audio, input_audio:{data, format}}`）
+                // 同样是 inlineData；不处理就会被静默丢掉，模型拿到空内容后会凭空编造
+                "input_audio" -> {
+                    val audio = part.objOrNull("input_audio") ?: continue
+                    val data = audio.stringOrNull("data").orEmpty()
+                    if (data.isEmpty()) continue
+                    flushText()
+                    val format = audio.stringOrNull("format").orEmpty().ifEmpty { "wav" }
+                    parts.add(JsonObject().apply {
+                        add("inlineData", JsonObject().apply {
+                            addProperty("mimeType", audioMimeOf(format))
+                            addProperty("data", data)
+                        })
+                    })
+                }
             }
         }
         flushText()
         return if (parts.size() > 0) parts else null
     }
 
-    private fun textContent(role: String, text: String): JsonObject = JsonObject().apply {
-        addProperty("role", role)
-        add("parts", JsonArray().apply { add(JsonObject().apply { addProperty("text", text) }) })
-    }
-
-    /** assistant 的 `tool_calls` → Gemini `functionCall` parts。 */
-    private fun functionCallsOf(message: JsonObject): JsonObject? {
-        val calls = message.arrayOrNull("tool_calls") ?: return null
-        if (calls.size() == 0) return null
-        val parts = JsonArray()
-        for (element in calls) {
-            val call = element.asObjectOrNull() ?: continue
-            val function = call.objOrNull("function") ?: continue
-            val args = function.stringOrNull("arguments").orEmpty()
-            parts.add(JsonObject().apply {
-                add("functionCall", JsonObject().apply {
-                    // id 必带：工具响应靠它配对（与 CLIProxyAPI 一致）
-                    addProperty("id", call.stringOrNull("id").orEmpty())
-                    addProperty("name", function.stringOrNull("name").orEmpty())
-                    add("args", runCatching { JsonParser.parseString(args).asJsonObject }.getOrElse { JsonObject() })
-                })
-            })
-        }
-        if (parts.size() == 0) return null
-        return JsonObject().apply {
-            addProperty("role", "model")
-            add("parts", parts)
-        }
-    }
-
-    /** 工具结果 → Gemini `functionResponse` part。 */
-    private fun functionResponseOf(message: JsonObject): JsonObject? {
-        val name = message.stringOrNull("name").orEmpty()
-        val content = textOf(message).orEmpty()
-        if (name.isEmpty()) return null
-        return JsonObject().apply {
-            addProperty("role", "user")
-            add("parts", JsonArray().apply {
-                add(JsonObject().apply {
-                    add("functionResponse", JsonObject().apply {
-                        // tool_call_id 原样带回，与 functionCall.id 配对
-                        addProperty("id", message.stringOrNull("tool_call_id").orEmpty())
-                        addProperty("name", name)
-                        add("response", JsonObject().apply {
-                            // result 保持字符串不解析：解析成 JSON 对象会触发上游 400（CLIProxyAPI 同样处理）
-                            addProperty("result", content.ifEmpty { "{}" })
-                        })
-                    })
-                })
-            })
+    /** OpenAI `input_audio.format`（裸格式名）→ MIME；已是 MIME 时原样返回。 */
+    fun audioMimeOf(format: String): String {
+        val value = format.trim().lowercase()
+        if (value.isEmpty()) return "audio/wav"
+        if (value.contains('/')) return value
+        return when (value) {
+            "mp3" -> "audio/mpeg"
+            "wav" -> "audio/wav"
+            "m4a", "mp4" -> "audio/mp4"
+            "webm" -> "audio/webm"
+            "ogg" -> "audio/ogg"
+            "flac" -> "audio/flac"
+            "aac" -> "audio/aac"
+            else -> "audio/$value"
         }
     }
 

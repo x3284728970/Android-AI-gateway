@@ -44,6 +44,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.aigw.app.ui.theme.LocalAppColors
@@ -129,6 +130,9 @@ fun PageScaffold(
         Column(
             modifier = Modifier
                 .fillMaxSize()
+                // 滚动到顶部/底部时内容与页头、屏幕边缘直接相接，看着像被切了一刀；
+                // 用背景色渐隐过渡（Motion.scrollFade），让长页面有「还能滚」的提示
+                .scrollFade()
                 .verticalScroll(rememberScrollState())
                 .padding(horizontal = 16.dp, vertical = 14.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp),
@@ -141,17 +145,21 @@ fun PageScaffold(
  * 白底描边卡片：1px 细线 + 圆角，无阴影。
  *
  * [enterIndex] 非空时卡片带错峰入场动效（第 n 张延迟 40ms·n），用于列表/表单页的首屏。
+ * [pressable] 为 true 时整张卡带按压回弹（可点入口专用）：卡片可点却毫无按下反馈时，
+ * 点上去像没反应，尤其在低帧率设备上。
  */
 @Composable
 fun SectionCard(
     modifier: Modifier = Modifier,
     enterIndex: Int? = null,
+    pressable: Boolean = false,
     content: @Composable ColumnScope.() -> Unit,
 ) {
     Box(
         modifier = Modifier
             .fillMaxWidth()
             .then(if (enterIndex != null) Modifier.staggeredAppear(enterIndex) else Modifier)
+            .then(if (pressable) Modifier.pressScale() else Modifier)
             .clip(MaterialTheme.shapes.large)
             .background(MaterialTheme.colorScheme.surface)
             .border(1.dp, MaterialTheme.colorScheme.outline, MaterialTheme.shapes.large)
@@ -298,7 +306,6 @@ fun StatCell(
     value: String,
     label: String,
     modifier: Modifier = Modifier,
-    highlight: Boolean = true,
     indicatorColor: Color = Color.Unspecified,
 ) {
     Column(modifier = modifier, horizontalAlignment = Alignment.Start) {
@@ -399,10 +406,26 @@ fun OutlineActionButton(
 }
 
 @Composable
-fun EmptyHint(title: String, message: String) {
+/**
+ * 空态 / 错误态提示：标题 + 说明 + 可选的下一步动作。
+ *
+ * 光说「没有数据」等于把用户晾在那儿；给出 [actionLabel] 时一并渲染按钮，
+ * 由调用方决定下一步是什么（去登录、重新拉取、重试）。
+ */
+fun EmptyHint(
+    title: String,
+    message: String,
+    actionLabel: String? = null,
+    onAction: (() -> Unit)? = null,
+) {
     Column(Modifier.fillMaxWidth().padding(vertical = 28.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Text(title, style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onSurface)
         Text(message, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        if (actionLabel != null && onAction != null) {
+            Box(modifier = Modifier.padding(top = 2.dp)) {
+                OutlineActionButton(actionLabel, onClick = onAction)
+            }
+        }
     }
 }
 
@@ -467,6 +490,42 @@ fun EditorialGroupHeader(index: String, title: String, meta: String? = null) {
         )
         if (meta != null) {
             Text(meta, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+    }
+}
+
+/**
+ * 细进度条：用于列表页展示「已用/可用」占比。
+ *
+ * [fraction] 为 null 表示占比未知（如额度字段缺失）——这时不画条，避免把「不知道」
+ * 画成 0%（与本项目「数据来源要诚实」的原则一致）。
+ */
+@Composable
+fun ThinRatioBar(
+    fraction: Float?,
+    modifier: Modifier = Modifier,
+    height: Dp = 5.dp,
+    color: Color = MaterialTheme.colorScheme.primary,
+) {
+    val animated by animateFloatAsState(
+        targetValue = (fraction ?: 0f).coerceIn(0f, 1f),
+        animationSpec = tween(Motion.BAR_FILL_MILLIS, easing = FastOutSlowInEasing),
+        label = "thinRatioBar",
+    )
+    Box(
+        modifier = modifier
+            .height(height)
+            .clip(CircleShape)
+            .background(MaterialTheme.colorScheme.surfaceContainerHighest),
+    ) {
+        if (fraction != null) {
+            Box(
+                Modifier
+                    .fillMaxWidth(animated)
+                    .height(height)
+                    .clip(CircleShape)
+                    .background(color),
+            )
         }
     }
 }

@@ -2,10 +2,15 @@ package dev.aigw.core.pool
 
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
+import dev.aigw.core.failover.AccountCandidate
+import dev.aigw.core.failover.AccountStrategy
+import dev.aigw.core.failover.orderAccounts
+import dev.aigw.core.provider.CreditUnit
 import dev.aigw.core.provider.ProviderAccount
 import dev.aigw.core.store.KeyValueStore
 import dev.aigw.core.util.objOrNull
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.locks.ReentrantReadWriteLock
 import kotlin.concurrent.read
 import kotlin.concurrent.write
@@ -18,6 +23,12 @@ data class AccountStatus(
     /** 权益包/积分余额；[creditsKnown] 为 false 时该值无意义。 */
     val credits: Long,
     val creditsKnown: Boolean,
+    /**
+     * 余额单位（见 [dev.aigw.core.provider.CreditUnit]）；空串等同 credits。
+     *
+     * 带单位是为了不把「配额剩余 87%」与「9 万积分」当成同一个数相加。
+     */
+    val creditUnit: String = "",
     /** provider 给出的额度补充说明（如「来源=团队，当日剩余=…」）。 */
     val detail: String,
     /** 上次失败原因（凭证失效或手动停用的说明）；空串表示一切正常。 */
@@ -28,6 +39,13 @@ data class AccountStatus(
     val enabled: Boolean,
     /** 使用优先级：数值越大越先用；同级仍按余额。默认 0。 */
     val priority: Int = 0,
+    /**
+     * 是否被手动移到了默认（uid 字典序）位置之上。
+     *
+     * 不能直接用 `priority > 0` 判定：↑/↓ 是交换两个账号的优先级，退回原顺序时高值会落到
+     * 另一个账号身上，「优先」标就会带着跑。这里比的是「实际位置 vs 默认位置」。
+     */
+    val raised: Boolean = false,
 ) {
     val usable: Boolean get() = !disabled && enabled
 }
@@ -38,21 +56,46 @@ data class PoolSummary(
     val usable: Int,
     val disabled: Int,
     val disabledByUser: Int,
+    /** 仅 [CreditUnit.CREDITS] 口径的余额合计；百分比余额不参与相加。 */
     val totalCredits: Long,
     /** 有多少个账号的额度是已知的。 */
     val creditsKnown: Int,
+    /** 有多少个账号的余额是百分比口径（不计入 [totalCredits]）。 */
+    val percentKnown: Int = 0,
 )
 
 private class Entry(var account: ProviderAccount) {
     var credits: Long = 0
     var creditsKnown: Boolean = false
+    var creditUnit: String = ""
     var detail: String = ""
     var disabled: Boolean = false
     var enabled: Boolean = true
     var reason: String = ""
     var priority: Int = 0
 
+    /**
+     * 额度重置时刻（毫秒，0 未知）。只用于 PACE 策略。
+     *
+     * 取各额度包里「最近的过期/重置时刻」：订阅类上游报的是窗口重置，
+     * 积分类报的是过期，两者语义都是「过了这一刻未用就作废」。
+     */
+    var resetAtMillis: Long = 0
+
     fun healthy(): Boolean = !disabled && enabled
+}
+
+/**
+ * 手动上移/下移后的位置是否真的高于默认位置。
+ *
+ * 拿它算「优先」标，而不是直接看 priority：↑/↓ 是交换两个账号的优先级，
+ * 退回原顺序时高值会跑到另一个账号身上，直接看 priority 会让标记带着跑。
+ */
+private fun raisedAboveDefault(providerId: String, uid: String, priority: Int, sorted: List<Entry>): Boolean {
+    if (priority <= 0) return false
+    val actual = sorted.indexOfFirst { it.account.uid == uid }
+    val defaultIndex = sorted.map { it.account.uid }.sorted().indexOf(uid)
+    return actual in 0 until defaultIndex
 }
 
 /**
@@ -61,8 +104,8 @@ private class Entry(var account: ProviderAccount) {
  * 选号与额度都按 provider 独立，互不影响；新增供应商不需要改这个类。
  * 挑选策略：该 provider 内可用账号中取余额最高者；同一请求内换号重试用 [pick] 的 exclude 排除。
  *
- * 不做本地冷却：上游每次报什么就是什么，由调用方（换号重试/跨供应商 Failover）应对，
- * 避免本地状态把明明可用的账号挡在门外。
+ * 本地冷却（[coolDown]）只解决一个具体问题：**刚被上游报错过的账号不要立刻再被选中**。
+ * 它不影响禁用/启用语义，到期自动恢复，也不落盘（重启即清零，与熔断/冷却表一致）。
  */
 class AccountPool(
     private val store: KeyValueStore,
@@ -74,8 +117,7 @@ class AccountPool(
     /** 按 provider 分组的条目索引：选号只需扫该供应商的账号，不必遍历整个池。 */
     private val byProvider = HashMap<String, MutableList<Entry>>()
 
-    /**
-     * 每个账号一把落盘串行锁（键 = providerId/uid）：同一账号的凭证/状态落盘与删除在这里互斥。
+    /** 每个账号一把落盘串行锁（键 = providerId/uid）：同一账号的凭证/状态落盘与删除在这里互斥。
      *
      * 内存状态在 [lock] 写锁内更新后，落盘被移到锁外执行 `store.write`：Android 侧一次 write
      * 就是整文件的加密 commit，持写锁落盘会把整个账号池的读（含选号 [pick]）全堵住，批量并发时
@@ -86,6 +128,12 @@ class AccountPool(
      * 而不是用调用时捕获的旧快照，故最终写出去的一定是最新值（详见 [persistState]）。
      */
     private val persistLocks = ConcurrentHashMap<String, Any>()
+
+    /** 本地冷却表：`providerId/uid` → 冷却截止毫秒（仅内存）。 */
+    private val cooldowns = ConcurrentHashMap<String, Long>()
+
+    /** ROTATE 策略的全局游标：递增到「下一个该用的位置」，天然均摊且无额外状态。 */
+    private val rotationCursor = AtomicLong(0)
 
     init {
         load()
@@ -107,6 +155,8 @@ class AccountPool(
                 // 否则会出现「重新登录后依然 503」——旧凭证的失效状态沾在新凭证上。
                 existing.disabled = false
                 existing.reason = ""
+                // 新凭证也要清掉旧凭证留下的本地冷却，否则刚换好的账号会被晾一会儿
+                cooldowns.remove(keyOf(account.providerId, account.uid))
             } else {
                 val entry = Entry(account)
                 entries[key] = entry
@@ -126,6 +176,7 @@ class AccountPool(
             true
         }
         if (!removed) return false
+        cooldowns.remove(keyOf(providerId, uid))
         // 删除同样放到锁外，并与该账号的落盘串行：[persistState] 落盘前会重读内存，若删除先完成
         // 它会读到「条目已不在」而直接跳过，不会把刚删掉的键又写回来。
         synchronized(accountIoLock(providerId, uid)) {
@@ -148,14 +199,31 @@ class AccountPool(
     }
 
     fun statuses(providerId: String? = null): List<AccountStatus> = lock.read {
-        entries.entries
+        val matched = entries.entries
             .filter { providerId == null || it.value.account.providerId == providerId }
-            // 优先级高的排前面；同级保持 uid 字典序，上下移动后列表即时可见
+        // 每个 provider 内部的默认顺序（uid 字典序）与当前顺序，用来判断哪些号真的被提上去了
+        val byProvider = matched.groupBy { it.value.account.providerId }
+        matched
             .sortedWith(
                 compareByDescending<MutableMap.MutableEntry<String, Entry>> { it.value.priority }
                     .thenBy { it.key },
             )
-            .map { statusOf(it.value) }
+            .map { entry ->
+                val provider = entry.value.account.providerId
+                val group = byProvider[provider].orEmpty()
+                val status = statusOf(entry.value)
+                status.copy(
+                    raised = raisedAboveDefault(
+                        providerId = provider,
+                        uid = entry.value.account.uid,
+                        priority = entry.value.priority,
+                        sorted = group.sortedWith(
+                            compareByDescending<MutableMap.MutableEntry<String, Entry>> { it.value.priority }
+                                .thenBy { it.key },
+                        ).map { it.value },
+                    ),
+                )
+            }
     }
 
     fun status(providerId: String, uid: String): AccountStatus? =
@@ -164,11 +232,6 @@ class AccountPool(
     fun size(providerId: String? = null): Int = lock.read {
         if (providerId == null) entries.size
         else byProvider[providerId]?.size ?: 0
-    }
-
-    /** 已知 provider 的 id 列表（按首次出现顺序）。 */
-    fun providerIds(): List<String> = lock.read {
-        entries.values.map { it.account.providerId }.distinct()
     }
 
     // ---------------------------------------------------------------- 状态
@@ -246,12 +309,17 @@ class AccountPool(
         credits: Long,
         known: Boolean = true,
         detail: String = "",
+        unit: String = "",
+        /** 额度重置/过期时刻（毫秒）；0 未知。PACE 策略靠它判断「快作废的先花」。 */
+        resetAtMillis: Long = 0L,
     ) {
         val found = lock.write {
             val entry = entries[keyOf(providerId, uid)] ?: return@write false
             entry.credits = credits
             entry.creditsKnown = known
             entry.detail = detail
+            entry.creditUnit = unit
+            entry.resetAtMillis = resetAtMillis
             true
         }
         if (found) persistState(providerId, uid)
@@ -265,23 +333,115 @@ class AccountPool(
         persistAccount(account)
     }
 
+    /**
+     * 迁移账号标识：把 [oldUid] 的条目换成 [newAccount]（uid 变了，凭证与状态跟着走）。
+     *
+     * 用在 uid 口径变更后的自愈（如小浣熊曾把 JWT 的 iss 当 uid 导致多账号共用一个 key）。
+     * 先登记新 key 再删旧 key：中途失败也不会把账号弄丢，最坏是两条并存，用户可手动删。
+     *
+     * @return true 表示真的搬了 key。
+     */
+    fun renameAccount(providerId: String, oldUid: String, newAccount: ProviderAccount): Boolean {
+        if (oldUid == newAccount.uid) {
+            upsert(newAccount)
+            return false
+        }
+        val before = status(providerId, oldUid)
+        upsert(newAccount)
+        if (before != null) {
+            if (!before.enabled) setEnabled(providerId, newAccount.uid, false, before.reason)
+            if (before.creditsKnown) updateCredits(providerId, newAccount.uid, before.credits, true, before.detail)
+        }
+        remove(providerId, oldUid)
+        return true
+    }
+
     // ---------------------------------------------------------------- 选号
 
-    /** 取该 provider 可用账号中余额最高者；[exclude] 用于同一请求内的换号重试。 */
-    fun pick(providerId: String, exclude: Set<String> = emptySet()): ProviderAccount? = lock.read {
+    /**
+     * 取该 provider 可用账号中优先级最高者，同级取余额最高者；[exclude] 用于同一请求内的换号重试。
+     *
+     * 这是 SMART 策略的快捷入口，与 [pickByStrategy] 的 SMART 分支同口径。
+     */
+    fun pick(providerId: String, exclude: Set<String> = emptySet(), accountFilter: (String) -> Boolean = { true }): ProviderAccount? =
+        pickByStrategy(providerId, AccountStrategy.SMART, exclude, accountFilter)
+
+    /**
+     * 按指定策略选号。
+     *
+     * 过滤条件（排除 / 不健康 / 冷却中 / 外部过滤）对所有策略一致——策略只决定「谁先谁后」，
+     * 不能把不可用的账号重新纳入。策略本身是纯函数（[orderAccounts]），便于单测与排障。
+     *
+     * [rotationCursor] 只对 ROTATE 生效：用「已发起请求数」当游标，天然均摊。
+     */
+    fun pickByStrategy(
+        providerId: String,
+        strategy: AccountStrategy,
+        exclude: Set<String> = emptySet(),
+        accountFilter: (String) -> Boolean = { true },
+    ): ProviderAccount? = lock.read {
         val group = byProvider[providerId] ?: return@read null
-        var best: Entry? = null
-        for (entry in group) {
-            if (entry.account.uid in exclude) continue
-            if (!entry.healthy()) continue
-            // 先比优先级（用户手动排序，最高优先），同级再比余额：
-            // 这样「优先账号先用」不会被余额更高的账号悄悄顶掉。
-            val cur = best
-            val better = cur == null || entry.priority > cur.priority ||
-                (entry.priority == cur.priority && entry.credits > cur.credits)
-            if (better) best = entry
+        val candidates = group.mapNotNull { entry ->
+            val uid = entry.account.uid
+            if (uid in exclude) return@mapNotNull null
+            if (!entry.healthy()) return@mapNotNull null
+            if (isCooling(providerId, uid)) return@mapNotNull null
+            if (!accountFilter(uid)) return@mapNotNull null
+            entry to AccountCandidate(
+                uid = uid,
+                priority = entry.priority,
+                credits = entry.credits,
+                creditsKnown = entry.creditsKnown,
+                resetAtMillis = entry.resetAtMillis,
+            )
         }
-        best?.account
+        if (candidates.isEmpty()) return@read null
+        val ordered = orderAccounts(
+            candidates = candidates.map { it.second },
+            strategy = strategy,
+            rotationCursor = if (strategy == AccountStrategy.ROTATE) rotationCursor.incrementAndGet() else 0L,
+            nowMillis = nowMillis(),
+        )
+        val byUid = candidates.associate { it.second.uid to it.first }
+        ordered.firstNotNullOfOrNull { byUid[it]?.account }
+    }
+
+    /**
+     * 把某个账号临时冷却一段时间（[durationMs] <= 0 时忽略）。
+     *
+     * 用在上游刚给过一次失败之后：失败本身已由熔断/换号处理，这里只防「下一个请求又选中它」
+     * 导致的连续失败。与禁用不同：不改变 enabled/disabled，界面上仍显示为可用。
+     */
+    fun coolDown(providerId: String, uid: String, durationMs: Long) {
+        if (durationMs <= 0) return
+        cooldowns["$providerId/$uid"] = nowMillis() + durationMs
+    }
+
+    /** 该账号是否在本地冷却中；到期项顺手清掉。 */
+    fun isCooling(providerId: String, uid: String): Boolean {
+        val key = "$providerId/$uid"
+        val deadline = cooldowns[key] ?: return false
+        if (nowMillis() >= deadline) {
+            cooldowns.remove(key, deadline)
+            return false
+        }
+        return true
+    }
+
+    /** 清掉该账号的本地冷却（成功一次或换了新凭证都该解除）。 */
+    fun clearCooldown(providerId: String, uid: String) {
+        cooldowns.remove("$providerId/$uid")
+    }
+
+    /** 当前仍在冷却中的账号：`providerId/uid` → 剩余毫秒。 */
+    fun cooldownSnapshot(): Map<String, Long> {
+        val now = nowMillis()
+        val out = LinkedHashMap<String, Long>()
+        for ((key, deadline) in cooldowns) {
+            val remaining = deadline - now
+            if (remaining > 0) out[key] = remaining else cooldowns.remove(key, deadline)
+        }
+        return out
     }
 
     /** 供界面展示的摘要；[providerId] 为空时统计全部。 */
@@ -295,6 +455,7 @@ class AccountPool(
         var disabledByUser = 0
         var totalCredits = 0L
         var creditsKnown = 0
+        var percentKnown = 0
         for (entry in source) {
             total++
             when {
@@ -303,8 +464,13 @@ class AccountPool(
                 else -> usable++
             }
             if (entry.creditsKnown) {
-                totalCredits += entry.credits
-                creditsKnown++
+                // 百分比余额与积分类不是同一个量纲，混进合计就是报假余额
+                if (entry.creditUnit == CreditUnit.PERCENT) {
+                    percentKnown++
+                } else {
+                    totalCredits += entry.credits
+                    creditsKnown++
+                }
             }
         }
         PoolSummary(
@@ -314,6 +480,7 @@ class AccountPool(
             disabledByUser = disabledByUser,
             totalCredits = totalCredits,
             creditsKnown = creditsKnown,
+            percentKnown = percentKnown,
         )
     }
 
@@ -325,6 +492,7 @@ class AccountPool(
         nickname = entry.account.nickname,
         credits = entry.credits,
         creditsKnown = entry.creditsKnown,
+        creditUnit = entry.creditUnit,
         detail = entry.detail,
         reason = entry.reason,
         disabled = entry.disabled,
@@ -362,7 +530,9 @@ class AccountPool(
     private fun stateJson(entry: Entry): JsonObject = JsonObject().apply {
         addProperty("credits", entry.credits)
         addProperty("creditsKnown", entry.creditsKnown)
+        addProperty("creditUnit", entry.creditUnit)
         addProperty("detail", entry.detail)
+        addProperty("resetAt", entry.resetAtMillis)
         addProperty("disabled", entry.disabled)
         addProperty("enabled", entry.enabled)
         addProperty("reason", entry.reason)
@@ -377,7 +547,9 @@ class AccountPool(
             readState(account.providerId, account.uid)?.let { state ->
                 entry.credits = state.get("credits")?.asLong ?: 0L
                 entry.creditsKnown = state.get("creditsKnown")?.asBoolean ?: false
+                entry.creditUnit = state.get("creditUnit")?.asString.orEmpty()
                 entry.detail = state.get("detail")?.asString.orEmpty()
+                entry.resetAtMillis = state.get("resetAt")?.asLong ?: 0L
                 entry.disabled = state.get("disabled")?.asBoolean ?: false
                 entry.enabled = state.get("enabled")?.asBoolean ?: true
                 entry.reason = state.get("reason")?.asString.orEmpty()

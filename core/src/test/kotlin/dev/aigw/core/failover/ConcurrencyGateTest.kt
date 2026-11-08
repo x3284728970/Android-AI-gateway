@@ -140,6 +140,65 @@ class ConcurrencyGateTest {
     }
 
     @Test
+    fun `per-account limit with global disabled never drives global counter negative`() {
+        // 回归：maxGlobal<=0（全局不限）而 maxPerAccount>0 时，账号许可路径的句柄曾无条件递减全局计数，
+        // 让 inFlightGlobal() 变成负数（等效放大上限）。
+        val gate = ConcurrencyGate { ConcurrencyConfig(maxPerAccount = 1, maxGlobal = 0, queueTimeoutMs = 100) }
+        val h = assertNotNull(gate.tryAcquire("p/a"))
+        assertEquals(1, gate.inFlightOf("p/a"))
+        assertEquals(0, gate.inFlightGlobal(), "全局不限时不应占用全局计数")
+
+        assertTrue(h.release())
+        assertEquals(0, gate.inFlightOf("p/a"))
+        assertEquals(0, gate.inFlightGlobal(), "释放后全局计数必须为 0，不得为负")
+        assertFalse(h.release())
+        assertEquals(0, gate.inFlightGlobal())
+    }
+
+    @Test
+    fun `both limits enabled drain counters to zero under concurrency`() {
+        val gate = ConcurrencyGate { ConcurrencyConfig(maxPerAccount = 1, maxGlobal = 1, queueTimeoutMs = 10_000) }
+        val pool = Executors.newFixedThreadPool(6)
+        val rejected = AtomicInteger(0)
+        val done = CountDownLatch(12)
+        repeat(12) {
+            pool.submit {
+                try {
+                    val h = gate.tryAcquire("p/a")
+                    if (h == null) {
+                        rejected.incrementAndGet()
+                        return@submit
+                    }
+                    try {
+                        Thread.sleep(5)
+                    } finally {
+                        h.release()
+                    }
+                } finally {
+                    done.countDown()
+                }
+            }
+        }
+        assertTrue(done.await(30, TimeUnit.SECONDS))
+        pool.shutdown()
+        assertEquals(0, rejected.get(), "10s 队列超时内不应有被拒的请求")
+        assertEquals(0, gate.inFlightGlobal())
+        assertEquals(0, gate.inFlightOf("p/a"))
+    }
+
+    @Test
+    fun `disabled handle never changes any counter`() {
+        val gate = ConcurrencyGate { ConcurrencyConfig(maxPerAccount = 0, maxGlobal = 0) }
+        val h = assertNotNull(gate.tryAcquire("p/a"))
+        assertEquals(0, gate.inFlightGlobal())
+        assertEquals(0, gate.inFlightOf("p/a"))
+
+        h.release()
+        assertEquals(0, gate.inFlightGlobal())
+        assertEquals(0, gate.inFlightOf("p/a"))
+    }
+
+    @Test
     fun `config clamps and survives json roundtrip with legacy payload`() {
         val cfg = ConcurrencyConfig.fromJson(
             com.google.gson.JsonParser.parseString(

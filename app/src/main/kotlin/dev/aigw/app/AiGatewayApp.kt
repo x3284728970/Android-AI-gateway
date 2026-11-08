@@ -33,27 +33,46 @@ class AiGatewayApp : Application() {
             spillDir = java.io.File(cacheDir, "call-fulltext"),
         )
         engine = created
-        val manager = getSystemService<NotificationManager>()
-        manager?.createNotificationChannel(
-            NotificationChannel(
-                CHANNEL_ID,
-                getString(R.string.channel_name),
-                NotificationManager.IMPORTANCE_LOW,
-            ).apply { description = getString(R.string.channel_desc) },
-        )
-        // 更新提醒单独一条渠道：让用户可以「只关更新提醒、保留网关常驻通知」。
-        // 用 DEFAULT 而不是 LOW——发到前台服务那个低优先级渠道里，用户根本不会注意到。
-        manager?.createNotificationChannel(
-            NotificationChannel(
-                UPDATE_CHANNEL_ID,
-                "版本更新",
-                NotificationManager.IMPORTANCE_DEFAULT,
-            ).apply { description = "发现新版本时提醒" },
-        )
+        getSystemService<NotificationManager>()?.apply {
+            createNotificationChannel(
+                NotificationChannel(
+                    CHANNEL_ID,
+                    getString(R.string.channel_name),
+                    NotificationManager.IMPORTANCE_LOW,
+                ).apply { description = getString(R.string.channel_desc) },
+            )
+            // 实时状态通知走独立渠道：无声无震。IMPORTANCE_LOW 是下限——
+            // IMPORTANCE_MIN 的通知不满足 Android 16 实时更新的提升要件。
+            createNotificationChannel(
+                NotificationChannel(
+                    LIVE_CHANNEL_ID,
+                    "实时状态",
+                    NotificationManager.IMPORTANCE_LOW,
+                ).apply {
+                    description = "仅在网关处理请求时显示，点击回到应用"
+                    setSound(null, null)
+                    enableVibration(false)
+                    enableLights(false)
+                    setShowBadge(false)
+                },
+            )
+            // 更新提醒单独一条渠道：让用户可以「只关更新提醒、保留网关常驻通知」。
+            // 用 DEFAULT 而不是 LOW——发到前台服务那个低优先级渠道里，用户根本不会注意到。
+            createNotificationChannel(
+                NotificationChannel(
+                    UPDATE_CHANNEL_ID,
+                    "版本更新",
+                    NotificationManager.IMPORTANCE_DEFAULT,
+                ).apply { description = "发现新版本时提醒" },
+            )
+        }
     }
 
     companion object {
         const val CHANNEL_ID = "aigw"
+
+        /** 实时状态通知渠道（Android 16 Live Updates 走这里）。 */
+        const val LIVE_CHANNEL_ID = "aigw_live"
 
         /** 更新提醒渠道（与网关常驻通知分开，便于单独关闭）。 */
         const val UPDATE_CHANNEL_ID = "aigw_update"

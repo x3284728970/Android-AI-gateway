@@ -53,12 +53,6 @@ enum class TraeRegion(
     ),
     ;
 
-    /** 额度/支付接口的版本段：国内 v2，国际 v1。 */
-    val payVersion: String get() = if (this == INTL) "v1" else "v2"
-
-    /** 国际版没有签到制度（前端 JS 里 checkin 零命中）。 */
-    val supportsCheckin: Boolean get() = this == CN
-
     companion object {
         fun of(id: String?): TraeRegion =
             entries.firstOrNull { it.id.equals(id?.trim(), ignoreCase = true) } ?: CN
@@ -164,7 +158,6 @@ object TraeConstants {
     /** 国际版（v1）额度接口。 */
     const val EP_ENTITLEMENT_INTL = "/trae/api/v1/pay/user_current_entitlement_list"
     const val EP_ENT_USAGE_INTL = "/trae/api/v1/pay/ide_user_ent_usage"
-    const val EP_USER_PAY_STATUS_INTL = "/trae/api/v1/pay/ide_user_pay_status"
 
     /** 请求未指定模型时使用的 config_name。 */
     const val DEFAULT_CONFIG_NAME = "glm-5.2"

@@ -49,9 +49,6 @@ data class PointsSnapshot(
 
     /** 上游是否真的回了余额字段。false = 不知道，界面应显示「—」而不是 0。 */
     val known: Boolean get() = personal >= 0 || team >= 0
-
-    /** 两个账本都拿不到数（全 0），多半是接口口径变了，需要看原文排查。 */
-    val suspicious: Boolean get() = known && balance <= 0
 }
 
 /**

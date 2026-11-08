@@ -32,15 +32,9 @@ Android 上运行的本地 AI 模型聚合网关：把多家私有 AI 服务账�
 
 ## 特性
 
-**协议面**
-
-- **双协议入口**：`/v1/chat/completions`（OpenAI）与 `/v1/messages`（Anthropic），都支持流式 SSE 与非流式。
-- **一套供应商实现，两种协议同时受益**：Anthropic 请求在网关入口翻译成 OpenAI 形状后复用同一批 Provider，响应再翻回去。新增供应商不需要写两遍。
-- **多模态识图**、工具调用（`tool_use` / `tool_calls` 双向映射）。
-
-**供应商**
-
-- **八家内置**：Trae、WorkBuddy / CodeBuddy、Antigravity、Loomy、小浣熊（商汤）、**LongCat（美团）**、**Today**，以及任意自定义 OpenAI 兼容中转站。
+- **OpenAI 兼容网关**：`/v1/chat/completions` + `/v1/models`，流式 SSE / 非流式 / 多模态识图；另提供 `/v1/images/generations`（图片生成）与 `/v1/audio/transcriptions`（语音转文字）。
+- **Anthropic 兼容入口**：`/v1/messages` 与 `/v1/messages/count_tokens`（本分支新增），请求在网关入口翻译成 OpenAI 形状后复用同一批 Provider，响应再翻回去——新增供应商不需要写两遍。
+- **十一家内置供应商**：Trae、WorkBuddy / CodeBuddy、Antigravity、ChatGPT、Loomy、小浣熊（商汤）、**LongCat（美团）**、**Today**、**Qoder**、**千问办公**、**百度搭子**，以及任意自定义 OpenAI 兼容中转站。
 - **同款模型 Failover**：首选供应商失败或无可用账号时，自动切换到拥有同款模型的其他供应商。
 - **智能路由**：`供应商/模型` 前缀路由（含 `trae-cn/`、`codebuddy-global/` 这类区域前缀与 `google/`、`agy/`、`lc/` 等别名），兼支持无前缀的模型名自动推导。
 
@@ -129,7 +123,7 @@ Provider 实现       上游私有协议 ⇄ OpenAI 协议（双向转换封死�
 | `:cli` | 纯 JVM 命令行 | 在本机直接起网关做端到端联调，或不打开 App 也能导入账号 / 签到 / 查用量与日志；可执行名 `aigw` |
 | `:app` | Android 应用 | Compose UI、前台服务与保活、加密存储实现、控制中心磁贴 |
 
-供应商协议实现位于 `core/src/main/kotlin/dev/aigw/core/provider/`，每家的私有协议细节都封装在各自子包内（`trae/`、`codebuddy/`、`antigravity/`、`loomy/`、`raccoon/`、`longcat/`、`today/`、`custom/`），互不干扰。
+供应商协议实现位于 `core/src/main/kotlin/dev/aigw/core/provider/`，每家的私有协议细节都封装在各自子包内（`trae/`、`codebuddy/`、`antigravity/`、`chatgpt/`、`loomy/`、`raccoon/`、`longcat/`、`today/`、`qoder/`、`qwenwork/`、`dumate/`、`cosy/`、`custom/`），互不干扰。
 
 协议转换层位于 `core/src/main/kotlin/dev/aigw/core/protocol/`：`OpenAiGemini.kt`（OpenAI ⇄ Gemini）、`AnthropicProtocol.kt`（Anthropic ⇄ OpenAI）。
 
@@ -188,8 +182,12 @@ usage/...                         # 用量统计
 | `POST` | `/v1/chat/completions` | OpenAI 对话补全，支持流式 SSE / 非流式 / 多模态 |
 | `POST` | `/v1/messages` | **Anthropic Messages**（本分支新增），支持流式 SSE / 非流式 |
 | `POST` | `/v1/messages/count_tokens` | **Anthropic token 估算**（本分支新增），按约 3 字符 1 token 估算 |
+| `POST` | `/v1/chat/completions` | 对话补全，支持流式 SSE / 非流式 / 多模态 |
+| `POST` | `/v1/images/generations` | 图片生成（OpenAI Images API；由具备图像通道的供应商承接，自动换号/切家） |
+| `POST` | `/v1/audio/transcriptions` | 语音转文字（multipart 上传；有原生转写端点的供应商优先，否则用声明了音频输入的对话模型代转写） |
 | `GET` | `/v1/models` | 模型列表（并发拉取各供应商后聚合返回；按模型开放名单过滤） |
 | `GET` | `/v1/credits` | 额度查询（别名 `/credits`；本机免 Key） |
+| `GET` | `/api/usage/token` | 令牌用量查询（new-api 形状，`total_available` 为按同单位汇总的真实余额） |
 | `GET` | `/healthz` | 健康检查，返回纯文本 `ok`（不带鉴权） |
 | `GET` | `/authorize` | Trae 网页登录回调入口（Antigravity / 小浣熊各有独立的本地回调端口） |
 
@@ -223,6 +221,7 @@ curl http://127.0.0.1:8790/v1/messages \
 | `antigravity` | Antigravity（Google） | `cloudcode-pa.googleapis.com` | Gemini 风格协议；凭证策略有铁律，见 ARCHITECTURE.md 第 5 节 |
 | `loomy` | Loomy（讯飞） | `xfinfr.com` | 鉴权失败为 HTTP 200 + 业务码，而非 4xx；登录用短信验证码 |
 | `raccoon` | 小浣熊（商汤） | `xiaohuanxiong.com` | OpenAI 结构被包在 `data` 里；字段用标准名（v2 LiteLLM 层不认 `max_new_tokens`） |
+| `chatgpt` | ChatGPT（OpenAI） | `chatgpt.com/backend-api/codex` | Codex 订阅额度（5 小时/周窗口）；OAuth 登录回调端口 1455 |
 | `longcat` | LongCat（美团） | `longcat.chat` | 双通道：免登录（IP 级限流）/ Cookie 登录；请求体无 `model` 字段 |
 | `today` | Today | `auth.todayai.cn` / `api.todayai.cn` | **无 SSE 接口**，轮询整段快照后本地差分出流；登录用短信验证码（+86）；模型自动发现 |
 | `custom:<key>` | 自定义 | 用户填写的 baseUrl | 任意 OpenAI 兼容中转站，一个 key = 一个账号 |
@@ -242,8 +241,7 @@ curl http://127.0.0.1:8790/v1/messages \
 
 ### 仅供学习与交流
 
-本项目是一个用于学习 HTTP 反向代理、SSE 流式透传、多上游协议适配与 Android 应用（Jetpack Compose）打包等技术主题的实践项目，**仅供个人学习与研究使用**。它不是官方产品，与腾讯公司及 WorkBuddy、商汤及小浣熊、字节跳动及 Trae、科大讯飞及 Loomy、Google 及 Antigravity、美团及 LongCat 均无任何关联，未获得其授权、认可或赞助。
-
+本项目是一个用于学习 HTTP 反向代理、SSE 流式透传、多上游协议适配与 Android 应用（Jetpack Compose）打包等技术主题的实践项目，**仅供个人学习与研究使用**。它不是官方产品，与腾讯公司及 WorkBuddy、商汤及小浣熊、字节跳动及 Trae、科大讯飞及 Loomy、Google 及 Antigravity、美团及 LongCat、OpenAI 及 ChatGPT、阿里及 Qoder / 千问办公、百度及搭子均无任何关联，未获得其授权、认可或赞助。
 ### 关于反向代理行为
 
 本项目实现的是本地反向代理：在你自己的机器上复用你自己账号的登录态，把请求转发到官方上游网关。它不破解、不绕过任何付费或权限校验，使用的额度始终来自你自己账号本就拥有的配额。但需要明确的是，这种「以非官方客户端形态复用登录态」的转发方式，**可能不符合上游服务的用户协议或使用条款**；是否使用、由此产生的一切后果（包括但不限于账号被限流、被风控、被冻结或封禁），均由使用者自行承担。

@@ -21,6 +21,16 @@ fun formatTokens(tokens: Long): String = when {
     else -> tokens.toString()
 }
 
+/** 耗时缩写：850ms / 22.3s / 5m12s / 1h03m。记录页胶囊用它代替动辄五位的毫秒值。 */
+fun formatDuration(millis: Long): String {
+    if (millis < 1_000L) return "${millis}ms"
+    if (millis < 60_000L) return String.format(Locale.US, "%.1fs", millis / 1000.0)
+    val seconds = millis / 1000L
+    if (seconds < 3_600L) return "${seconds / 60}m${(seconds % 60).toString().padStart(2, '0')}s"
+    val hours = seconds / 3_600L
+    return "${hours}h${((seconds % 3_600L) / 60L).toString().padStart(2, '0')}m"
+}
+
 /** 字节数：1.58 MB / 812 KB。 */
 fun formatBytes(bytes: Long): String = when {
     bytes <= 0 -> "—"

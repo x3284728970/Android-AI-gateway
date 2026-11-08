@@ -108,7 +108,12 @@ class QoderChatClient(
 
     /**
      * 拉模型目录。**必须走 COSY 签名**（裸 Bearer 会被 401 拒），
-     * 响应字段是 `chat` 数组，条目里 `key` 是模型名、`price_factor` 是倍率。
+     * 条目里 `key` 是模型名、`price_factor` 是倍率。
+     *
+     * 响应按 **scene 分桶**（`chat` / `app` …），个别模型只出现在单一 scene 里
+     * （QoDuck=`lmodel` 只在 `app`），只读 `chat` 会把它们整条丢掉——不只是列表里看不见，
+     * 路由也会判成不支持。这里按 scene 顺序合并、同名以先出现的为准（chat 优先）。
+     * 参考：EchoPing07/Qoder-2API-Go 2026-11-08 的同名修复。
      */
     fun fetchModels(): List<String>? {
         val sess = sessionProvider(account)
@@ -154,12 +159,28 @@ class QoderChatClient(
         }
         val root = runCatching { JsonParser.parseString(body).asJsonObject }.getOrNull()
             ?: throw IllegalStateException("模型目录响应不是 JSON：${body.take(120)}")
-        val list = root.arrayOrNull("chat") ?: root.arrayOrNull("data") ?: return null
-        return list.mapNotNull { item ->
-            val obj = item.takeIf { it.isJsonObject }?.asJsonObject ?: return@mapNotNull null
-            if (obj.get("enable")?.let { it.isJsonPrimitive && !it.asBoolean } == true) return@mapNotNull null
-            obj.stringOrNull("key").orEmpty().takeIf { it.isNotEmpty() }
-        }.ifEmpty { null }
+        val scenes = listOf("chat", "app")
+        val keys = LinkedHashSet<String>()
+        for (scene in scenes) {
+            val list = root.arrayOrNull(scene) ?: continue
+            for (item in list) {
+                val obj = item.takeIf { it.isJsonObject }?.asJsonObject ?: continue
+                if (obj.get("enable")?.let { it.isJsonPrimitive && !it.asBoolean } == true) continue
+                val key = obj.stringOrNull("key").orEmpty()
+                if (key.isEmpty() || key == "auto") continue
+                keys += key
+            }
+        }
+        if (keys.isEmpty()) {
+            // 老响应形态：直接给数组（data 或裸数组），没有 scene 分桶
+            val list = root.arrayOrNull("data") ?: return null
+            list.mapNotNull { item ->
+                val obj = item.takeIf { it.isJsonObject }?.asJsonObject ?: return@mapNotNull null
+                if (obj.get("enable")?.let { it.isJsonPrimitive && !it.asBoolean } == true) return@mapNotNull null
+                obj.stringOrNull("key").orEmpty().takeIf { it.isNotEmpty() }
+            }.ifEmpty { null }?.let { return it }
+        }
+        return keys.toList().ifEmpty { null }
     }
 
     /**

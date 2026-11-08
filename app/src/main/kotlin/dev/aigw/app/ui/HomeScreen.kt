@@ -6,34 +6,63 @@ import android.os.Build
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateMapOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.State
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.PathMeasure
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.DrawScope
@@ -41,6 +70,8 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.layout.boundsInRoot
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
@@ -49,7 +80,12 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import dev.aigw.app.ui.theme.DeepInk
 import dev.aigw.app.ui.theme.LocalAppColors
+import dev.aigw.app.ui.theme.WarningAmber
+import dev.aigw.core.provider.RoutedModel
+import dev.aigw.core.usage.CallRecord
+import dev.aigw.core.usage.CallStatus
 import dev.aigw.core.usage.UsageStats
 import dev.aigw.core.util.startOfDay
 import java.text.SimpleDateFormat
@@ -64,7 +100,6 @@ private const val TREND_DAYS = 14
 fun HomeScreen(
     state: AppUiState,
     viewModel: AppViewModel,
-    openProviders: () -> Unit,
     openTaskCenter: () -> Unit,
 ) {
     val context = LocalContext.current
@@ -108,7 +143,9 @@ fun HomeScreen(
             },
         )
 
-        TelemetryGrid(state, Modifier.staggeredAppear(1))
+        LiveRoutingTopologyCard(state, Modifier.staggeredAppear(1))
+
+        TelemetryGrid(state, Modifier.staggeredAppear(2))
 
         // 批量动作进行中/结束：首页也要看得到进度与失败原因（签到按钮就在本页）
         BatchProgressHost(state.batchProgress)
@@ -116,7 +153,7 @@ fun HomeScreen(
 
         TrendCard(state)
 
-        SectionCard(modifier = Modifier.staggeredAppear(3)) {
+        SectionCard(modifier = Modifier.staggeredAppear(4)) {
             SectionHeader("快捷操作 · ACTIONS")
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -163,7 +200,7 @@ fun HomeScreen(
             }
         }
 
-        AntigravityQuotaSection(state, viewModel, baseIndex = 4)
+        AntigravityQuotaSection(state, viewModel, baseIndex = 5)
     }
 }
 
@@ -267,6 +304,910 @@ private fun ConsoleCard(
     }
 }
 
+// ---------------------------------------------------------------------- 拓扑结构数据模型
+private data class TopologyProviderBranch(
+    val providerId: String,
+    val displayName: String,
+    val usableAccounts: Int,
+    val totalAccounts: Int,
+    val weight: Float,
+    val hasActiveRequest: Boolean,
+    val activeCount: Int,
+    val colorIndex: Int,
+)
+
+/**
+ * 实时调度拓扑卡（数据驱动的供应商分发视图）：
+ * - 中枢节点：网关（显示 :port，运行中呼吸发光，停止时静止置灰）
+ * - 分支节点：真实有账号的供应商，显示供应商名 + 可用账号数
+ * - 分支权重（线宽/流动/亮度）：按最近 50 次请求里该供应商的请求数占比；无请求时退化为可用账号数占比
+ * - 在途请求：所在供应商高亮金色并流动光斑，没有在途时不流动、不高亮
+ * - 多分支折叠：超过 4 个供应商时前 3 个展示，其余合并为「+N 其它」
+ * - 小屏（360dp）：自适应单列/紧凑布局
+ */
+@Composable
+private fun LiveRoutingTopologyCard(state: AppUiState, modifier: Modifier = Modifier) {
+    val gold = LocalAppColors.current.goldStart
+    val goldEnd = LocalAppColors.current.goldEnd
+    val palette = LocalAppColors.current.providerPalette
+    val isRunning = state.running
+
+    val recentCalls = remember(state.calls) { state.calls.take(50) }
+    val activeRequests = state.activeRequests
+    val hasActive = isRunning && activeRequests.isNotEmpty()
+
+    // 统计最近 50 次请求中各供应商的请求数
+    val callCountsByProvider = remember(recentCalls) {
+        recentCalls.groupBy { it.providerId.lowercase() }.mapValues { it.value.size }
+    }
+    val totalRecentCalls = remember(callCountsByProvider) { callCountsByProvider.values.sum() }
+
+    // 活跃在途请求按供应商分组统计
+    val activeCountsByProvider = remember(activeRequests) {
+        activeRequests.groupBy { it.providerId.lowercase() }.mapValues { it.value.size }
+    }
+
+    // 真实有账号的供应商
+    val branches = remember(state.accounts, state.providers, callCountsByProvider, activeCountsByProvider, totalRecentCalls) {
+        val groupedAccounts = state.accounts.groupBy { it.providerId.lowercase() }
+        if (groupedAccounts.isEmpty()) {
+            emptyList()
+        } else {
+            val totalUsableOverall = state.accounts.count { it.usable }.coerceAtLeast(1)
+            val sortedProviderIds = groupedAccounts.keys.sortedByDescending { pid ->
+                val callCount = callCountsByProvider[pid] ?: 0
+                val usable = groupedAccounts[pid]?.count { it.usable } ?: 0
+                // 优先按请求数排序，相同时按可用账号数
+                (callCount.toLong() shl 16) + usable
+            }
+
+            sortedProviderIds.mapIndexed { index, pid ->
+                val accs = groupedAccounts[pid] ?: emptyList()
+                val usable = accs.count { it.usable }
+                val provInfo = state.providers.firstOrNull { it.id.equals(pid, ignoreCase = true) }
+                val dName = provInfo?.displayName?.ifEmpty { pid.uppercase() } ?: pid.uppercase()
+
+                val weight = if (totalRecentCalls > 0) {
+                    ((callCountsByProvider[pid] ?: 0).toFloat() / totalRecentCalls).coerceIn(0.08f, 1f)
+                } else {
+                    (usable.toFloat() / totalUsableOverall).coerceIn(0.08f, 1f)
+                }
+
+                val activeCount = activeCountsByProvider[pid] ?: 0
+
+                TopologyProviderBranch(
+                    providerId = pid,
+                    displayName = dName,
+                    usableAccounts = usable,
+                    totalAccounts = accs.size,
+                    weight = weight,
+                    hasActiveRequest = activeCount > 0,
+                    activeCount = activeCount,
+                    colorIndex = index,
+                )
+            }
+        }
+    }
+
+    val basisCaption = if (totalRecentCalls > 0) {
+        "按近 50 次请求分布"
+    } else if (state.accounts.isNotEmpty()) {
+        "暂无请求，按可用账号分布"
+    } else {
+        "暂无配置账号"
+    }
+
+    // 在途流光：曲线上的光斑进度 0f→1f，只在绘制阶段读取，不逐帧重组。
+    // 1.6s 一趟比原来的 1s 慢一些，长曲线上的光斑才不会显得在跳。
+    val flowPhase: State<Float> = rememberInfiniteTransition(label = "topologyFlow").animateFloat(
+        initialValue = 0f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 1600, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart,
+        ),
+        label = "topologyFlowPhase",
+    )
+
+    SectionCard(modifier = modifier) {
+        // 顶部小节头 + 呼吸指示灯 + TODAY 大数字
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Box(
+                Modifier.breathingDot(
+                    color = if (isRunning) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f),
+                    size = 7.dp,
+                    breathing = isRunning,
+                    haloSize = 15.dp,
+                ),
+            )
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = "实时调度拓扑 · LIVE TOPOLOGY",
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    letterSpacing = 1.2.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(
+                    text = basisCaption,
+                    style = MaterialTheme.typography.bodySmall.copy(fontSize = 10.sp),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f),
+                )
+            }
+
+            // 右侧在途/今日计数
+            Row(
+                verticalAlignment = Alignment.Bottom,
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                if (activeRequests.isNotEmpty()) {
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(4.dp))
+                            .background(gold.copy(alpha = 0.16f))
+                            .padding(horizontal = 6.dp, vertical = 2.dp),
+                    ) {
+                        Text(
+                            text = "${activeRequests.size} 在途",
+                            style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                            fontWeight = FontWeight.Bold,
+                            color = goldEnd,
+                        )
+                    }
+                }
+
+                Row(
+                    verticalAlignment = Alignment.Bottom,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    Text(
+                        text = "TODAY",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(bottom = 2.dp),
+                    )
+                    AnimatedContent(
+                        targetState = state.today.requests,
+                        transitionSpec = {
+                            slideInVertically(
+                                animationSpec = tween(Motion.TAB_MILLIS, easing = FastOutSlowInEasing),
+                            ) { it / 2 } + fadeIn() togetherWith
+                                slideOutVertically(
+                                    animationSpec = tween(Motion.TAB_MILLIS, easing = FastOutSlowInEasing),
+                                ) { -it / 2 } + fadeOut()
+                        },
+                        label = "todayRequests",
+                    ) { reqCount ->
+                        Text(
+                            text = if (reqCount > 0) formatCount(reqCount) else "—",
+                            style = MaterialTheme.typography.titleMedium.copy(fontFamily = FontFamily.Monospace),
+                            fontWeight = FontWeight.Bold,
+                            color = if (reqCount > 0) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
+        }
+
+        Spacer(Modifier.height(4.dp))
+
+        // 拓扑主体分发视图：
+        // 中枢网关节点位于左侧，各供应商分支位于右侧
+        if (branches.isEmpty()) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(68.dp)
+                    .clip(MaterialTheme.shapes.small)
+                    .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f)),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    text = "暂无可用供应商账号",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        } else {
+            // 分支折叠逻辑：最多显示 3 个主要分支，超过则把剩余合并为「+N」
+            val maxVisibleBranches = 3
+            val displayBranches = if (branches.size > 4) branches.take(maxVisibleBranches) else branches
+            val remainingCount = if (branches.size > 4) branches.size - maxVisibleBranches else 0
+
+            // 连线要按各行的真实位置扇出，先把容器、中枢与每一行在 root 坐标系里的矩形量出来
+            var containerRect by remember { mutableStateOf<Rect?>(null) }
+            var hubRect by remember { mutableStateOf<Rect?>(null) }
+            val rowRects = remember { mutableStateMapOf<String, Rect>() }
+            var otherRect by remember { mutableStateOf<Rect?>(null) }
+            val branchById = remember(branches) { branches.associateBy { it.providerId } }
+
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .onGloballyPositioned { containerRect = it.boundsInRoot() },
+            ) {
+                // 连线画在最底层：曲线从中枢右缘扇出、终点落在各节点行左缘，端点被卡片盖住
+                TopologyWiresCanvas(
+                    container = containerRect,
+                    hub = hubRect,
+                    rows = rowRects,
+                    branches = branchById,
+                    other = otherRect,
+                    isRunning = isRunning,
+                    gold = gold,
+                    goldEnd = goldEnd,
+                    phase = flowPhase,
+                )
+
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    // 左侧中枢节点：网关 Hub，垂直居中于整列分支
+                    GatewayHubNode(
+                        isRunning = isRunning,
+                        port = state.port,
+                        gold = gold,
+                        goldEnd = goldEnd,
+                        hasActive = hasActive,
+                        modifier = Modifier.onGloballyPositioned { hubRect = it.boundsInRoot() },
+                    )
+
+                    // 右侧分发分支列：左侧留出连线走廊，节点不再自己画线
+                    Column(
+                        modifier = Modifier
+                            .weight(1f)
+                            .padding(start = 44.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        displayBranches.forEach { branch ->
+                            val branchColor = palette[branch.colorIndex % palette.size]
+                            ProviderBranchRow(
+                                branch = branch,
+                                branchColor = branchColor,
+                                gold = gold,
+                                isRunning = isRunning,
+                                modifier = Modifier.onGloballyPositioned {
+                                    rowRects[branch.providerId] = it.boundsInRoot()
+                                },
+                            )
+                        }
+
+                        if (remainingCount > 0) {
+                            val otherUsable = branches.drop(maxVisibleBranches).sumOf { it.usableAccounts }
+                            Box(
+                                modifier = Modifier
+                                    .onGloballyPositioned { otherRect = it.boundsInRoot() }
+                                    .clip(RoundedCornerShape(6.dp))
+                                    .background(MaterialTheme.colorScheme.surfaceContainerHighest)
+                                    .padding(horizontal = 8.dp, vertical = 3.dp),
+                            ) {
+                                Text(
+                                    text = "+$remainingCount 其它 (${otherUsable}可用)",
+                                    style = MaterialTheme.typography.bodySmall.copy(fontSize = 10.sp),
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        HorizontalDivider(
+            color = MaterialTheme.colorScheme.outlineVariant,
+            modifier = Modifier.padding(vertical = 2.dp),
+        )
+
+        // 块 2：最近一个请求的路由流水
+        RecentCallRoutingFlow(state.calls.firstOrNull())
+
+        HorizontalDivider(
+            color = MaterialTheme.colorScheme.outlineVariant,
+            modifier = Modifier.padding(vertical = 2.dp),
+        )
+
+        // 块 3 与 块 4：上下文容量监控 + 明细列表（按模型聚合近 50 次请求）
+        ContextCapacityAndModelBreakdown(state)
+    }
+}
+
+/**
+ * 拓扑单个分支行：供应商节点胶囊。
+ *
+ * 连线不再由行内自己画——那正是从前「线悬空、没接到网关」的来源：每行的线只从自己左缘起笔，
+ * 而网关卡片只有一行高，除正中一行外的线左侧都对着空白。现在曲线统一由 [TopologyWiresCanvas]
+ * 从网关右缘扇出。
+ */
+@Composable
+private fun ProviderBranchRow(
+    branch: TopologyProviderBranch,
+    branchColor: Color,
+    gold: Color,
+    isRunning: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    val isBranchActive = branch.hasActiveRequest && isRunning
+    Box(
+        modifier = modifier
+            .clip(RoundedCornerShape(8.dp))
+            .drawBehind {
+                if (isBranchActive) {
+                    drawRoundRect(
+                        color = gold.copy(alpha = 0.15f),
+                        size = size,
+                        cornerRadius = CornerRadius(8.dp.toPx()),
+                    )
+                }
+            }
+            .background(MaterialTheme.colorScheme.surface)
+            .border(
+                width = if (isBranchActive) 1.5.dp else 1.dp,
+                color = if (isBranchActive) gold else branchColor.copy(alpha = 0.45f),
+                shape = RoundedCornerShape(8.dp),
+            )
+            .padding(horizontal = 10.dp, vertical = 5.dp),
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Box(Modifier.size(6.dp).clip(CircleShape).background(branchColor))
+            Column {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    Text(
+                        text = branch.displayName,
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.SemiBold,
+                        color = if (isBranchActive) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.85f),
+                        maxLines = 1,
+                    )
+                    if (branch.activeCount > 0) {
+                        Text(
+                            text = "(${branch.activeCount}在途)",
+                            style = MaterialTheme.typography.bodySmall.copy(fontSize = 9.sp, fontFamily = FontFamily.Monospace),
+                            color = gold,
+                            fontWeight = FontWeight.Bold,
+                        )
+                    }
+                }
+                Text(
+                    text = "${branch.usableAccounts}/${branch.totalAccounts} 可用",
+                    style = MaterialTheme.typography.bodySmall.copy(fontSize = 10.sp, fontFamily = FontFamily.Monospace),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                )
+            }
+        }
+    }
+}
+
+/**
+ * 拓扑连线层：从中枢节点右缘向每个分支行的左缘扇出贝塞尔曲线。
+ *
+ * - 线宽与透明度都取分发权重（0.08–1.0）：旧实现只把权重映射到 1.7–4px 且透明度一致，肉眼分不出。
+ * - 有在途请求的分支沿曲线跑一个光斑，进度用 sin 包络在两端淡入淡出，避免端点处突然出现。
+ * - 进度以 [State] 传入、在绘制阶段读取，因此每帧只重绘，不重组拓扑卡。
+ */
+@Composable
+private fun BoxScope.TopologyWiresCanvas(
+    container: Rect?,
+    hub: Rect?,
+    rows: Map<String, Rect>,
+    branches: Map<String, TopologyProviderBranch>,
+    other: Rect?,
+    isRunning: Boolean,
+    gold: Color,
+    goldEnd: Color,
+    phase: State<Float>,
+) {
+    val box = container ?: return
+    val hubBox = hub ?: return
+    val idleColor = MaterialTheme.colorScheme.outlineVariant
+    Canvas(modifier = Modifier.matchParentSize()) {
+        val startX = hubBox.right - box.left - 2.dp.toPx()
+        val startY = hubBox.center.y - box.top
+        val progress = phase.value
+
+        val targets = ArrayList<Triple<Rect, Float, Boolean>>()
+        rows.forEach { (pid, rect) ->
+            val branch = branches[pid] ?: return@forEach
+            targets.add(Triple(rect, branch.weight, branch.hasActiveRequest && isRunning))
+        }
+        other?.let { targets.add(Triple(it, 0.08f, false)) }
+
+        targets.forEach { (rect, weight, active) ->
+            val endX = rect.left - box.left
+            val endY = rect.center.y - box.top
+            val dx = endX - startX
+            val path = Path().apply {
+                moveTo(startX, startY)
+                cubicTo(startX + dx * 0.45f, startY, endX - dx * 0.45f, endY, endX, endY)
+            }
+            val stroke = (1.1f + weight * 2.4f).dp.toPx()
+            drawPath(
+                path = path,
+                color = (if (active) gold else idleColor).copy(alpha = 0.5f + weight * 0.5f),
+                style = Stroke(width = stroke, cap = StrokeCap.Round),
+            )
+            if (active) {
+                val measure = PathMeasure().apply { setPath(path, false) }
+                if (measure.length > 0f) {
+                    val envelope = kotlin.math.sin(progress * kotlin.math.PI).toFloat()
+                    val center = measure.getPosition(progress * measure.length)
+                    drawCircle(
+                        color = goldEnd.copy(alpha = 0.28f * envelope),
+                        radius = stroke + 4.dp.toPx(),
+                        center = center,
+                    )
+                    drawCircle(
+                        color = goldEnd.copy(alpha = envelope),
+                        radius = stroke / 2f + 2.dp.toPx(),
+                        center = center,
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * 网关中枢节点：运行中时金色描边 + 微发光晕，停止时置灰。
+ */
+@Composable
+private fun GatewayHubNode(
+    isRunning: Boolean,
+    port: Int,
+    gold: Color,
+    goldEnd: Color,
+    hasActive: Boolean = false,
+    modifier: Modifier = Modifier,
+) {
+    Box(
+        modifier = modifier
+            .clip(MaterialTheme.shapes.medium)
+            .drawBehind {
+                if (isRunning) {
+                    val haloAlpha = if (hasActive) 0.22f else 0.10f
+                    drawRoundRect(
+                        color = gold.copy(alpha = haloAlpha),
+                        size = size,
+                        cornerRadius = CornerRadius(10.dp.toPx()),
+                    )
+                }
+            }
+            .background(MaterialTheme.colorScheme.surface)
+            .border(
+                width = if (hasActive) 1.5.dp else 1.dp,
+                color = if (isRunning) gold else MaterialTheme.colorScheme.outline,
+                shape = MaterialTheme.shapes.medium,
+            )
+            .padding(horizontal = 12.dp, vertical = 10.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(
+                text = "AI-GATEWAY",
+                style = MaterialTheme.typography.labelSmall,
+                fontWeight = FontWeight.Bold,
+                letterSpacing = 0.8.sp,
+                color = if (isRunning) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.height(2.dp))
+            Text(
+                text = ":$port",
+                style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp, fontFamily = FontFamily.Monospace),
+                fontWeight = FontWeight.SemiBold,
+                color = if (isRunning) goldEnd else MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+/**
+ * 块 2：最近一个请求的路由流水。
+ * 三行流水（小圆点 + 文案）：
+ * 1. 客户端请求 <model>
+ * 2. 路由到 <PROVIDER·大写> · <accountNickname 或 accountUid>
+ * 3. 结果 <成功/失败/中断> · HTTP <httpStatus> · 耗时 <x.x s> · tokens <in>→<out>
+ */
+@Composable
+private fun RecentCallRoutingFlow(call: CallRecord?) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(
+            text = "最近路由记录 · LATEST DISPATCH",
+            style = MaterialTheme.typography.labelSmall,
+            fontWeight = FontWeight.SemiBold,
+            letterSpacing = 0.8.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+
+        if (call == null) {
+            Text(
+                text = "暂无请求记录",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(vertical = 4.dp),
+            )
+            return@Column
+        }
+
+        val dotNeutral = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
+        val resultColor = when (call.status) {
+            CallStatus.SUCCESS -> MaterialTheme.colorScheme.tertiary
+            CallStatus.FAILED -> MaterialTheme.colorScheme.error
+            CallStatus.ABORTED -> WarningAmber
+        }
+        val resultText = when (call.status) {
+            CallStatus.SUCCESS -> "成功"
+            CallStatus.FAILED -> "失败"
+            CallStatus.ABORTED -> "客户端中断"
+        }
+
+        val modelName = call.model.ifEmpty { "未记录" }
+        val accountDisplay = call.accountNickname.ifEmpty { call.accountUid.ifEmpty { "默认账号" } }
+        val durationText = formatDuration(call.durationMillis)
+        val promptTokensStr = formatTokens(call.promptTokens)
+        val completionTokensStr = formatTokens(call.completionTokens)
+
+        // 行 1：客户端请求
+        RoutingFlowRow(
+            dotColor = dotNeutral,
+            label = "客户端请求",
+            detail = modelName,
+        )
+
+        // 行 2：路由去向
+        RoutingFlowRow(
+            dotColor = LocalAppColors.current.goldStart,
+            label = "路由到",
+            detail = "${call.providerId.uppercase()} · $accountDisplay",
+        )
+
+        // 行 3：结果与耗时
+        RoutingFlowRow(
+            dotColor = resultColor,
+            label = "结果",
+            detail = "$resultText · HTTP ${call.httpStatus} · 耗时 $durationText",
+        )
+
+        // 行 4：开销 tokens
+        val tokenDetail = buildString {
+            append("输入 $promptTokensStr · 输出 $completionTokensStr")
+            if (call.cachedTokens > 0) {
+                append(" · 缓存 ${formatTokens(call.cachedTokens)}")
+            }
+        }
+        RoutingFlowRow(
+            dotColor = dotNeutral,
+            label = "Token",
+            detail = tokenDetail,
+        )
+    }
+}
+
+@Composable
+private fun RoutingFlowRow(dotColor: Color, label: String, detail: String) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Box(
+            modifier = Modifier
+                .size(6.dp)
+                .clip(CircleShape)
+                .background(dotColor),
+        )
+        Text(
+            text = label,
+            style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp),
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Text(
+            text = detail,
+            style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp, fontFamily = FontFamily.Monospace),
+            color = MaterialTheme.colorScheme.onSurface,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f),
+        )
+    }
+}
+
+/** 单个模型的近 50 次请求聚合统计。 */
+private data class ModelTokenAggregation(
+    val model: String,
+    val requests: Int,
+    val promptTokens: Long,
+)
+
+/**
+ * 在 state.models 里匹配 contextWindow：
+ * 1. 用 providerId + model (完全匹配 ProviderModel.id 或 name，并支持剥离 routePrefix)；
+ * 2. 退化为任意 provider 下匹配模型名；
+ * 3. 0 或未匹配返回 0L (表示未知)。
+ */
+private fun resolveContextWindow(
+    providerId: String,
+    modelName: String,
+    models: List<RoutedModel>,
+): Long {
+    if (modelName.isEmpty() || models.isEmpty()) return 0L
+    val cleanName = modelName.substringAfterLast('/')
+
+    // 1. 精确匹配同 providerId
+    val matched = models.firstOrNull { routed ->
+        routed.providerId.equals(providerId, ignoreCase = true) &&
+            (routed.model.id.equals(modelName, ignoreCase = true) ||
+                routed.model.id.equals(cleanName, ignoreCase = true) ||
+                routed.model.name.equals(cleanName, ignoreCase = true) ||
+                routed.fullId.equals(modelName, ignoreCase = true))
+    }
+    if (matched != null && matched.model.contextWindow > 0L) {
+        return matched.model.contextWindow
+    }
+
+    // 2. 任意 provider 跨域同名匹配
+    val fallback = models.firstOrNull { routed ->
+        routed.model.id.equals(cleanName, ignoreCase = true) ||
+            routed.model.name.equals(cleanName, ignoreCase = true)
+    }
+    if (fallback != null && fallback.model.contextWindow > 0L) {
+        return fallback.model.contextWindow
+    }
+    return 0L
+}
+
+/**
+ * 块 3 与 块 4：上下文容量监控 + 明细列表（近 50 次请求按模型聚合）
+ */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun ContextCapacityAndModelBreakdown(state: AppUiState) {
+    val recentCalls = remember(state.calls) { state.calls.take(50) }
+    val latestCall = recentCalls.firstOrNull()
+
+    // 块 3：大数字计算
+    val promptTokens = latestCall?.promptTokens ?: 0L
+    val cachedTokens = latestCall?.cachedTokens ?: 0L
+    val contextWindow = remember(latestCall, state.models) {
+        if (latestCall != null) {
+            resolveContextWindow(latestCall.providerId, latestCall.model, state.models)
+        } else {
+            0L
+        }
+    }
+
+    // 近 50 次聚合列表（按 promptTokens 倒序）
+    val aggregated = remember(recentCalls) {
+        recentCalls
+            .groupBy { it.model.ifEmpty { "未命名模型" } }
+            .map { (model, calls) ->
+                ModelTokenAggregation(
+                    model = model,
+                    requests = calls.size,
+                    promptTokens = calls.sumOf { it.promptTokens },
+                )
+            }
+            .sortedByDescending { it.promptTokens }
+    }
+    val totalPromptTokens = remember(aggregated) { aggregated.sumOf { it.promptTokens } }
+
+    val palette = LocalAppColors.current.providerPalette
+    var expanded by remember { mutableStateOf(false) }
+
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        // 标题说明
+        Text(
+            text = "上下文容量与分布 · CONTEXT & MODELS",
+            style = MaterialTheme.typography.labelSmall,
+            fontWeight = FontWeight.SemiBold,
+            letterSpacing = 0.8.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+
+        // 块 3：左右双指标
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            // 左列：输入 tokens，下方整合成一行小字说明上限与剩余
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = if (latestCall != null) formatTokens(promptTokens) else "—",
+                    style = MaterialTheme.typography.headlineSmall.copy(fontFamily = FontFamily.Monospace),
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+                val remainingText = if (contextWindow > 0L && contextWindow >= promptTokens) {
+                    "剩余 ${formatTokens(contextWindow - promptTokens)}"
+                } else if (contextWindow > 0L) {
+                    "超出上限"
+                } else {
+                    "剩余未知"
+                }
+                val limitText = if (contextWindow > 0L) "上限 ${formatTokens(contextWindow)}" else "上限未知"
+                Text(
+                    text = "$limitText · $remainingText",
+                    style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp, fontFamily = FontFamily.Monospace),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+
+            // 右列：缓存命中率
+            Column(
+                horizontalAlignment = Alignment.End,
+            ) {
+                val hitRateText = if (promptTokens > 0L) {
+                    String.format(Locale.US, "%.1f%%", (cachedTokens.toDouble() / promptTokens) * 100.0)
+                } else {
+                    "—"
+                }
+                Text(
+                    text = hitRateText,
+                    style = MaterialTheme.typography.headlineSmall.copy(fontFamily = FontFamily.Monospace),
+                    fontWeight = FontWeight.Bold,
+                    color = if (cachedTokens > 0L) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.onSurface,
+                )
+                Text(
+                    text = "缓存命中",
+                    style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+
+        // 分段条标题：严格口径
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = "近 50 次请求的输入 token 按模型",
+                style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Text(
+                text = if (totalPromptTokens > 0L) formatTokens(totalPromptTokens) else "暂无 token 数据",
+                style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp, fontFamily = FontFamily.Monospace),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+
+        // 分段进度条与图例：无数据不画条；只有 1 个模型时省去分段条与图例（直接看下方明细，消除重复冗余）；≥2 个模型时才画条和图例
+        if (totalPromptTokens > 0L && aggregated.size > 1) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(6.dp)
+                    .clip(RoundedCornerShape(3.dp))
+                    .background(MaterialTheme.colorScheme.surfaceVariant),
+            ) {
+                aggregated.forEachIndexed { index, item ->
+                    val fraction = item.promptTokens.toFloat() / totalPromptTokens
+                    val animatedFraction by animateFloatAsState(
+                        targetValue = fraction,
+                        animationSpec = tween(Motion.BAR_FILL_MILLIS, easing = FastOutSlowInEasing),
+                        label = "modelTokenBar$index",
+                    )
+                    val color = palette[index % palette.size]
+                    Box(
+                        modifier = Modifier
+                            .weight(animatedFraction.coerceAtLeast(0.001f))
+                            .fillMaxSize()
+                            .background(color),
+                    )
+                }
+            }
+
+            // 图例一览（FlowRow 自适应换行，每项完整展示）
+            FlowRow(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                aggregated.take(4).forEachIndexed { index, item ->
+                    val color = palette[index % palette.size]
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        Box(Modifier.size(6.dp).clip(CircleShape).background(color))
+                        Text(
+                            text = "${item.model.substringAfterLast('/')} (${formatTokens(item.promptTokens)})",
+                            style = MaterialTheme.typography.bodySmall.copy(fontSize = 10.sp),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                        )
+                    }
+                }
+                if (aggregated.size > 4) {
+                    Text(
+                        text = "+${aggregated.size - 4}",
+                        style = MaterialTheme.typography.bodySmall.copy(fontSize = 10.sp),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        } else if (totalPromptTokens <= 0L) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(6.dp)
+                    .clip(RoundedCornerShape(3.dp))
+                    .background(MaterialTheme.colorScheme.surfaceContainerHighest),
+            )
+        }
+
+        // 块 4：明细列表（可折叠）
+        if (aggregated.isNotEmpty()) {
+            val visibleCount = if (expanded) aggregated.size else 5
+            val displayItems = aggregated.take(visibleCount)
+
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 4.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                displayItems.forEachIndexed { index, item ->
+                    val color = palette[index % palette.size]
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Box(Modifier.size(6.dp).clip(CircleShape).background(color))
+                        Text(
+                            text = item.model,
+                            style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp),
+                            color = MaterialTheme.colorScheme.onSurface,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f),
+                        )
+                        Text(
+                            text = "${item.requests} 次",
+                            style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp, fontFamily = FontFamily.Monospace),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Text(
+                            text = formatTokens(item.promptTokens),
+                            style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp, fontFamily = FontFamily.Monospace),
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.onSurface,
+                        )
+                    }
+                }
+
+                // 展开/收起按钮
+                if (aggregated.size > 5) {
+                    Text(
+                        text = if (expanded) "收起" else "显示全部 ${aggregated.size} 项",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = LocalAppColors.current.goldText,
+                        modifier = Modifier
+                            .clickable { expanded = !expanded }
+                            .padding(vertical = 4.dp),
+                    )
+                }
+            }
+        }
+    }
+}
+
 /** 状态圆点：运行中绿色带浅光环，停止灰色。 */
 @Composable
 private fun StatusDot(running: Boolean) {
@@ -336,7 +1277,7 @@ private fun TrendCard(state: AppUiState) {
         trend.size >= 2 && trend.any { it.promptTokens > 0 || it.completionTokens > 0 }
     }
     val gold = LocalAppColors.current.goldStart
-    SectionCard(modifier = Modifier.staggeredAppear(2)) {
+    SectionCard(modifier = Modifier.staggeredAppear(3)) {
         SectionHeader("消耗趋势 · TREND", action = if (trend.isEmpty()) null else "近 ${trend.size} 天")
         if (drawable) {
             TrendChart(trend, startOfDay(System.currentTimeMillis()))

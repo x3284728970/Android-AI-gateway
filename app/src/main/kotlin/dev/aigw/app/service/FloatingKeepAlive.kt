@@ -8,7 +8,6 @@ import android.os.Build
 import android.provider.Settings
 import android.view.Gravity
 import android.view.MotionEvent
-import android.view.View
 import android.view.WindowManager
 import android.widget.TextView
 import dev.aigw.app.MainActivity
@@ -184,7 +183,4 @@ object FloatingKeepAlive {
         (value * context.resources.displayMetrics.density).roundToInt()
 
     private const val PREFS = "aigw_overlay"
-
-    /** 供状态展示：悬浮窗是否正在显示。 */
-    fun currentLabel(): String? = view?.text?.toString()
 }

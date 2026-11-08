@@ -78,6 +78,11 @@ import dev.aigw.app.ui.ProxyScreen
 import dev.aigw.app.ui.ResilienceScreen
 import dev.aigw.app.ui.SecurityProtectionScreen
 import dev.aigw.app.ui.SubPage
+import dev.aigw.app.ui.AccountTransferScreen
+import dev.aigw.app.ui.ClientKeysScreen
+import dev.aigw.app.ui.ModelPricingScreen
+import dev.aigw.app.ui.RequestRewriteScreen
+import dev.aigw.app.ui.RoutingGroupsScreen
 import dev.aigw.app.ui.TaskCenterScreen
 import dev.aigw.app.ui.UsageScreen
 import dev.aigw.app.ui.formatBytes
@@ -257,7 +262,16 @@ private fun AppRoot(viewModel: AppViewModel, state: AppUiState) {
                 )
 
                 SubPage.Usage -> UsageScreen(state, viewModel) { subPage = null }
-                SubPage.TaskCenter -> TaskCenterScreen(state, viewModel) { subPage = null }
+                SubPage.TaskCenter -> TaskCenterScreen(
+                    state = state,
+                    viewModel = viewModel,
+                    onOpenProviders = {
+                        // 空态里的「去供应商页」：切回供应商 tab，并关掉这个二级页
+                        tab = Tab.Providers
+                        subPage = null
+                    },
+                    onBack = { subPage = null },
+                )
                 SubPage.CreditCenter -> CreditCenterScreen(
                     state = state,
                     onOpen = { subPage = SubPage.ProviderCredits(it) },
@@ -276,6 +290,11 @@ private fun AppRoot(viewModel: AppViewModel, state: AppUiState) {
                 SubPage.Resilience -> ResilienceScreen(state, viewModel) { subPage = null }
                 SubPage.DataManagement -> DataManagementScreen(state, viewModel) { subPage = null }
                 SubPage.AppearanceTheme -> AppearanceThemeScreen(state, viewModel) { subPage = null }
+                SubPage.AccountTransfer -> AccountTransferScreen(state, viewModel) { subPage = null }
+                SubPage.ClientKeys -> ClientKeysScreen(state, viewModel) { subPage = null }
+                SubPage.RoutingGroups -> RoutingGroupsScreen(state, viewModel) { subPage = null }
+                SubPage.ModelPricing -> ModelPricingScreen(state, viewModel) { subPage = null }
+                SubPage.RequestRewrite -> RequestRewriteScreen(state, viewModel) { subPage = null }
                 null -> MainTabs(
                     viewModel = viewModel,
                     state = state,
@@ -416,7 +435,6 @@ private fun MainTabs(
             Tab.Home -> HomeScreen(
                 state = state,
                 viewModel = viewModel,
-                openProviders = { onTab(Tab.Providers) },
                 openTaskCenter = { onSubPage(SubPage.TaskCenter) },
             )
             Tab.Providers -> ProviderListScreen(

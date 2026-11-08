@@ -49,7 +49,8 @@ class QwenProvider(
 
     override fun listModels(account: ProviderAccount?): ProviderModelCatalogView {
         val parsed = account?.let { runCatching { QwenAccount.parse(it.secret) }.getOrNull() }
-            ?: return ProviderModelCatalogView(fallbackModels(), fromFallback = true, error = "未登录，先登录后可显示真实模型目录")
+            // 未登录不是「拉取失败」：只给兜底列表，不报错
+            ?: return ProviderModelCatalogView(fallbackModels(), fromFallback = true, error = "")
         val cached = cachedCatalog
         val now = nowMillis()
         if (cached != null && now - cached.at < CATALOG_TTL_MS) {

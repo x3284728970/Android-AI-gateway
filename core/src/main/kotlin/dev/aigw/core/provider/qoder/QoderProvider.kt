@@ -65,7 +65,8 @@ class QoderProvider(
 
     override fun listModels(account: ProviderAccount?): ProviderModelCatalogView {
         val parsed = account?.let { runCatching { QoderAccount.parse(it.secret) }.getOrNull() }
-            ?: return ProviderModelCatalogView(fallbackModels(), fromFallback = true, error = "未选择账号")
+            // 未登录不是「拉取失败」：模型页只该显示兜底列表，不该挂红字错误
+            ?: return ProviderModelCatalogView(fallbackModels(), fromFallback = true, error = "")
         val realm = parsed.region
         val cached = catalogs[realm.id]
         val now = nowMillis()

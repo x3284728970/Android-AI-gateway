@@ -39,8 +39,6 @@ fun JsonObject.boolOrNull(name: String): Boolean? = get(name)?.takeIf { it.isJso
 /** 数组元素的安全取值。 */
 fun JsonElement.asObjectOrNull(): JsonObject? = takeIf { it.isJsonObject }?.asJsonObject
 
-fun JsonElement.asStringOrNull(): String? = takeIf { it.isJsonPrimitive }?.asString
-
 /** 取字符串字段，缺字段/JsonNull/类型不符时回退 [fallback]。 */
 fun JsonObject.str(key: String, fallback: String = ""): String {
     val v = get(key) ?: return fallback

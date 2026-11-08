@@ -194,7 +194,9 @@ class FailoverIntegrationTest {
         try {
             val (status, resp) = post(server.listeningPort, "my-model")
             assertEquals(400, status, "客户端参数错必须向客户端返回 400")
-            assertTrue(resp.contains("upstream_rejected"))
+            // 错误码按真实分类给（不再是笼统的 upstream_rejected），消息用供应商给的原话
+            assertTrue(resp.contains("\"code\":\"invalid_request\""), resp)
+            assertTrue(resp.contains("invalid_request_error"), resp)
             assertEquals(1, p1Calls)
             assertEquals(0, p2Calls, "客户端错误绝不能污染备选供应商")
         } finally {
@@ -321,7 +323,8 @@ class FailoverIntegrationTest {
         val server = GatewayHttpServer(engine, "127.0.0.1", 0).apply { start(0, true) }
         try {
             val (status, _) = post(server.listeningPort, "my-model")
-            assertEquals(503, status)
+            // 全候选都是上游 5xx：主因是上游故障，回 502 而不是笼统的 503「没有可用账号」
+            assertEquals(502, status)
             val record = engine.callLogStore.list().firstOrNull()
             assertTrue(record != null, "全候选失败也应留下一条调用记录")
             assertEquals(502, record.httpStatus, "应记录最后一次上游的真实状态")
@@ -382,7 +385,7 @@ class FailoverIntegrationTest {
     }
 
     @Test
-    fun `所有候选供应商均耗尽时聚合报错返回 503`() {
+    fun `所有候选供应商均耗尽时按真实主因返回错误码`() {
         val engine = GatewayEngine(InMemoryKeyValueStore())
         val p1 = ConfigurableProvider("p1", listOf("m")) { _, _ -> FailedChatCall(500, "p1 down") }
         val p2 = ConfigurableProvider("p2", listOf("m")) { _, _ -> FailedChatCall(504, "p2 timeout") }
@@ -408,8 +411,10 @@ class FailoverIntegrationTest {
         val server = GatewayHttpServer(engine, "127.0.0.1", 0).apply { start(0, true) }
         try {
             val (status, resp) = post(server.listeningPort, "my-model")
-            assertEquals(503, status)
-            assertTrue(resp.contains("所有候选供应商均不可用"))
+            // 两家都是 5xx → 主因 SERVER：502 upstream_error，且逐家原因仍要带上
+            assertEquals(502, status)
+            assertTrue(resp.contains("upstream_error"), resp)
+            assertTrue(resp.contains("上游服务异常"), resp)
             assertTrue(resp.contains("p1"))
             assertTrue(resp.contains("p2"))
         } finally {

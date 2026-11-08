@@ -51,7 +51,12 @@ fun ProviderListScreen(
     ) {
         if (state.providers.isEmpty()) {
             SectionCard {
-                EmptyHint("还没有供应商", "内置供应商会在启动时自动登记；自定义供应商可点右上角「+」添加。")
+                EmptyHint(
+                    title = "还没有供应商",
+                    message = "内置供应商会在启动时自动登记；自定义供应商可点右上角「+」添加。",
+                    actionLabel = "添加自定义供应商",
+                    onAction = onAddCustom,
+                )
             }
             return@PageScaffold
         }
@@ -63,7 +68,12 @@ fun ProviderListScreen(
         }
         for ((index, provider) in state.providers.withIndex()) {
             val ui = remember(provider.id) { ProviderUiRegistry.of(provider.id) }
-            SectionCard(modifier = Modifier.staggeredAppear(index).clickable { onOpen(provider.id) }) {
+            // enterIndex 交给 SectionCard 自己做错峰入场（不要叠两次 staggeredAppear，延迟会叠加）
+            SectionCard(
+                enterIndex = index,
+                pressable = true,
+                modifier = Modifier.clickable { onOpen(provider.id) },
+            ) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,

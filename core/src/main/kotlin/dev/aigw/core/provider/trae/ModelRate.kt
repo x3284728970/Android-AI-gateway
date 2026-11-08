@@ -68,9 +68,6 @@ object ModelRates {
     /** 查倍率；没有公开数据时返回 null（界面不展示，不要瞎猜）。 */
     fun rateOf(modelId: String): ModelRate? = TABLE[modelId.trim().lowercase(Locale.US)]
 
-    /** 所有已知倍率的模型 ID 数（便于测试与自检）。 */
-    val knownCount: Int get() = TABLE.size
-
     /** 全表快照，供自检（如“每条都必须带来源说明”）遍历。 */
     fun all(): Map<String, ModelRate> = TABLE.toMap()
 

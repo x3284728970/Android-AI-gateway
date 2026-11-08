@@ -6,6 +6,7 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.service.quicksettings.TileService
+import androidx.browser.customtabs.CustomTabsIntent
 import androidx.compose.runtime.Immutable
 import androidx.compose.ui.graphics.Color
 import androidx.core.content.ContextCompat
@@ -24,6 +25,7 @@ import dev.aigw.app.ui.theme.formatHex
 import dev.aigw.app.ui.theme.parseHexColor
 import dev.aigw.app.service.GatewayService
 import dev.aigw.app.service.GatewayTileService
+import dev.aigw.app.service.LoginWaitService
 import dev.aigw.core.gateway.BatchActionResult
 import dev.aigw.core.gateway.BatchProgress
 import dev.aigw.core.gateway.BatchTarget
@@ -48,7 +50,6 @@ import dev.aigw.core.provider.ProviderCapability
 import dev.aigw.core.provider.QuotaPack
 import dev.aigw.core.provider.custom.CustomProvider
 import dev.aigw.core.provider.RoutedModel
-import dev.aigw.core.provider.trae.TraeRegion
 import dev.aigw.core.provider.trae.TraeProvider
 import dev.aigw.core.store.KeyValueStore
 import dev.aigw.core.update.ApkDownloader
@@ -251,7 +252,7 @@ data class AppUiState(
     val port: Int = GatewaySettings.DEFAULT_PORT,
     val localUrl: String = "",
     val lanUrls: List<String> = emptyList(),
-    val pool: PoolSummary = PoolSummary(0, 0, 0, 0, 0, 0),
+    val pool: PoolSummary = PoolSummary(0, 0, 0, 0, 0, 0, 0),
     val today: UsageStats = UsageStats(),
     /** 最近 30 天的每日聚合（下标 0 最早、末尾今天）。 */
     val daily: List<UsageStats> = emptyList(),
@@ -301,14 +302,16 @@ data class AppUiState(
     val security: dev.aigw.core.security.SecuritySettings = dev.aigw.core.security.SecuritySettings(),
     /** 可选的悬浮窗保活是否开启（需「显示在其他应用上层」权限）。 */
     val overlayKeepAlive: Boolean = false,
+    /** 开机 / 应用更新后自动恢复网关（默认关）。 */
+    val startOnBoot: Boolean = false,
+    /** 实时状态通知（仅网关有请求在途时显示）是否开启，默认开。 */
+    val liveNotification: Boolean = true,
     /** 模型开放名单：只对外暴露勾选的模型。 */
     val modelExposure: dev.aigw.core.gateway.ModelExposureSettings = dev.aigw.core.gateway.ModelExposureSettings(),
     /** 故障转移与并发配置。 */
     val failover: dev.aigw.core.failover.ModelFailoverSettings = dev.aigw.core.failover.ModelFailoverSettings(),
     /** 出网取证记录列表。 */
     val evidences: List<dev.aigw.core.security.OutboundEvidence> = emptyList(),
-    /** 当前生效的脱敏规则词汇数。 */
-    val sanitizerRulesCount: Int = 0,
     val busy: String = "",
     val notice: String = "",
     /** 批量动作进行中的进度；非空时 UI 显示「已完成 X/N（当前：某账号）」。 */
@@ -323,6 +326,20 @@ data class AppUiState(
     val updateDownload: UpdateDownload? = null,
     /** 是否自动检查更新（启动时每天最多一次）。 */
     val autoCheckUpdate: Boolean = true,
+    /** 当前网关在途请求列表（轻量快照）。 */
+    val activeRequests: List<dev.aigw.core.gateway.ActiveRequest> = emptyList(),
+    /** 客户端密钥（谁能调用网关）。 */
+    val clientKeys: List<dev.aigw.core.gateway.ClientKey> = emptyList(),
+    /** 各密钥的累计用量，键为密钥 id。 */
+    val clientKeyUsages: Map<String, dev.aigw.core.gateway.KeyUsage> = emptyMap(),
+    /** 路由组与规则。 */
+    val routingGroups: dev.aigw.core.gateway.RoutingGroupSettings = dev.aigw.core.gateway.RoutingGroupSettings(),
+    /** 模型价格表。 */
+    val pricing: dev.aigw.core.usage.PricingTable = dev.aigw.core.usage.PricingTable(),
+    /** 请求改写设置。 */
+    val middleware: dev.aigw.core.gateway.MiddlewareSettings = dev.aigw.core.gateway.MiddlewareSettings(),
+    /** 各改写中间件最近一次失败原因，键为中间件 id。 */
+    val middlewareFailures: Map<String, String> = emptyMap(),
 ) {
     /** 某个供应商的账号。 */
     fun accountsOf(providerId: String): List<AccountStatus> = accounts.filter { it.providerId == providerId }
@@ -351,10 +368,17 @@ private class Snapshot(
     val keepAlive: KeepAliveStatus,
     val security: dev.aigw.core.security.SecuritySettings,
     val evidences: List<dev.aigw.core.security.OutboundEvidence>,
-    val sanitizerRulesCount: Int,
     val modelExposure: dev.aigw.core.gateway.ModelExposureSettings,
     val failover: dev.aigw.core.failover.ModelFailoverSettings,
     val overlayKeepAlive: Boolean,
+    val liveNotification: Boolean,
+    val startOnBoot: Boolean,
+    val clientKeys: List<dev.aigw.core.gateway.ClientKey>,
+    val clientKeyUsages: Map<String, dev.aigw.core.gateway.KeyUsage>,
+    val routingGroups: dev.aigw.core.gateway.RoutingGroupSettings,
+    val pricing: dev.aigw.core.usage.PricingTable,
+    val middleware: dev.aigw.core.gateway.MiddlewareSettings,
+    val middlewareFailures: Map<String, String>,
 )
 
 class AppViewModel(
@@ -404,7 +428,22 @@ class AppViewModel(
     @Volatile
     private var modelsFetchedAt = 0L
 
+    private var lastActiveSignature = ""
+    private val activeRequestsListener: (List<dev.aigw.core.gateway.ActiveRequest>) -> Unit = { list ->
+        val sig = list.joinToString(";") { "${it.id}:${it.providerId}:${it.phase}" }
+        if (sig != lastActiveSignature) {
+            lastActiveSignature = sig
+            viewModelScope.launch(Dispatchers.Main.immediate) {
+                _state.value = _state.value.copy(activeRequests = list)
+            }
+        }
+    }
+
     init {
+        engine.activeRequests.addListener(activeRequestsListener)
+        val initialActive = engine.activeRequests.snapshot()
+        lastActiveSignature = initialActive.joinToString(";") { "${it.id}:${it.providerId}:${it.phase}" }
+        _state.value = _state.value.copy(activeRequests = initialActive)
         // 登录在浏览器里完成、由网关的回调监听落池，这里接住通知刷新界面。
         // 只有账号集合真的变了才重拉模型：刷新凭证（refreshAccount 回存）也会触发本回调，
         // 那类更新不影响模型列表，重复拉取只是白白多打一轮上游。
@@ -418,9 +457,18 @@ class AppViewModel(
                 refresh()
             }
         }
+        // 历史遗留的账号标识自愈（如小浣熊早期把 JWT 的 iss 当 uid，导致多账号在池里共用一个 key）：
+        // 后台跑一次，真搬了 key 再刷界面；没搬动就不打扰
+        viewModelScope.launch {
+            val moved = withContext(Dispatchers.IO) { engine.migrateAccounts() }
+            if (moved > 0) refresh()
+        }
         // 调用记录与统计改在引擎后台预载（冷启动不阻塞主线程），就绪后补一次刷新
         engine.setStartupDataReadyListener { refresh() }
         refresh()
+        // 被系统强停过（force-stop 会清掉粘性服务与所有定时唤醒）时，打开应用就地恢复，
+        // 不再要求用户多点一次「启动网关服务」。
+        maybeAutoResume()
         // 自动检查更新：默认开启，每天最多一次，失败静默
         // 历史遗留的账号标识自愈（如小浣熊早期把 JWT 的 iss 当 uid，导致多账号共用一个 key）：
         // 后台跑一次，真搬了 key 再刷界面；没搬动就不打扰
@@ -435,6 +483,7 @@ class AppViewModel(
         accounts.joinToString("|") { "${it.providerId}/${it.uid}/${it.disabled}/${it.enabled}" }
 
     override fun onCleared() {
+        engine.activeRequests.removeListener(activeRequestsListener)
         engine.onAccountsChanged = null
         engine.setStartupDataReadyListener(null)
     }
@@ -465,10 +514,17 @@ class AppViewModel(
                     keepAlive = KeepAlive.status(app),
                     security = engine.securitySettings(),
                     evidences = engine.sanitizer.evidenceList(),
-                    sanitizerRulesCount = engine.sanitizer.currentRulesCount(),
                     modelExposure = engine.modelExposureSettings(),
                     failover = engine.failoverSettings(),
                     overlayKeepAlive = dev.aigw.app.data.KeepAlivePrefs.overlayEnabled(engine.store()),
+                    liveNotification = dev.aigw.app.data.KeepAlivePrefs.liveNotificationEnabled(engine.store()),
+                    startOnBoot = dev.aigw.app.data.KeepAlivePrefs.startOnBoot(engine.store()),
+                    clientKeys = engine.clientKeyStore.list(),
+                    clientKeyUsages = engine.clientKeyStore.list().associate { it.id to engine.clientKeyUsage.usageOf(it.id) },
+                    routingGroups = engine.routingGroupSettings(),
+                    pricing = engine.pricingTable(),
+                    middleware = engine.middlewareSettings(),
+                    middlewareFailures = engine.middleware().failures(),
                 )
             }
             _state.value = _state.value.copy(
@@ -492,10 +548,17 @@ class AppViewModel(
                 keepAlive = snapshot.keepAlive,
                 security = snapshot.security,
                 evidences = snapshot.evidences,
-                sanitizerRulesCount = snapshot.sanitizerRulesCount,
                 modelExposure = snapshot.modelExposure,
                 failover = snapshot.failover,
                 overlayKeepAlive = snapshot.overlayKeepAlive,
+                liveNotification = snapshot.liveNotification,
+                startOnBoot = snapshot.startOnBoot,
+                clientKeys = snapshot.clientKeys,
+                clientKeyUsages = snapshot.clientKeyUsages,
+                routingGroups = snapshot.routingGroups,
+                pricing = snapshot.pricing,
+                middleware = snapshot.middleware,
+                middlewareFailures = snapshot.middlewareFailures,
             )
         }
     }
@@ -653,8 +716,6 @@ class AppViewModel(
 
     // ------------------------------------------------------------------ 模型开放名单
 
-    fun modelExposure(): ModelExposureSettings = engine.modelExposureSettings()
-
     fun updateModelExposure(updated: ModelExposureSettings) {
         viewModelScope.launch {
             withContext(Dispatchers.IO) { engine.updateModelExposure(updated) }
@@ -704,15 +765,33 @@ class AppViewModel(
                 // 引擎没起来就撤掉前台通知，避免「通知说运行中、端口没人听」
                 app.stopService(Intent(app, GatewayService::class.java))
                 _state.value = _state.value.copy(notice = "启动失败：$error")
+            } else {
+                // 兜底：若服务在启动竞态里先退了（onStartCommand 时引擎还没就绪会
+                // stopSelf），这里把服务再拉回来——引擎在跑就必须有服务看管，
+                // 否则又回到「端口开着、无人看管」的孤儿态。onStartCommand 幂等。
+                ContextCompat.startForegroundService(app, Intent(app, GatewayService::class.java))
+                dev.aigw.app.data.KeepAlivePrefs.setWantRunning(engine.store(), true)
             }
             refresh()
             requestTileUpdate()
         }
     }
 
+    /**
+     * 应用打开时恢复上次状态（见 [dev.aigw.app.data.KeepAlivePrefs.wantRunning]）。
+     * 只在意图为真、且引擎确实没在跑时动作一次，不会与用户手动操作打架。
+     */
+    private fun maybeAutoResume() {
+        if (engine.isRunning()) return
+        if (!dev.aigw.app.data.KeepAlivePrefs.wantRunning(engine.store())) return
+        startGateway()
+        _state.value = _state.value.copy(notice = "已自动恢复上次的运行状态")
+    }
+
     fun stopGateway() {
         viewModelScope.launch {
             withContext(Dispatchers.IO) { engine.stop() }
+            dev.aigw.app.data.KeepAlivePrefs.setWantRunning(engine.store(), false)
             app.stopService(Intent(app, GatewayService::class.java))
             _state.value = _state.value.copy(notice = "服务已停止")
             refresh()
@@ -753,6 +832,85 @@ class AppViewModel(
         }
     }
 
+    // ------------------------------------------------------------ 客户端密钥
+
+    /** 新建密钥；[onCreated] 在创建后回调（用于把完整密钥展示一次给用户复制）。 */
+    fun addClientKey(
+        name: String,
+        secret: String?,
+        allowedModels: List<String>,
+        limits: List<dev.aigw.core.gateway.KeyLimit>,
+        onCreated: (dev.aigw.core.gateway.ClientKey) -> Unit = {},
+    ) {
+        viewModelScope.launch {
+            val created = withContext(Dispatchers.IO) {
+                runCatching { engine.clientKeyStore.add(name, secret, allowedModels, limits) }.getOrNull()
+            }
+            if (created == null) {
+                _state.value = _state.value.copy(notice = "密钥不合法：长度需 8~256 个可打印字符且不能重复")
+            } else {
+                onCreated(created)
+            }
+            refresh()
+        }
+    }
+
+    fun updateClientKey(key: dev.aigw.core.gateway.ClientKey) {
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) { engine.clientKeyStore.update(key) }
+            refresh()
+        }
+    }
+
+    fun removeClientKey(id: String) {
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) {
+                engine.clientKeyStore.remove(id)
+                engine.clientKeyUsage.clear(id)
+            }
+            refresh()
+        }
+    }
+
+    /** 轮换密钥：[onRotated] 拿到新密钥后必须立刻展示给用户，之后只能看到末四位。 */
+    fun rotateClientKey(id: String, onRotated: (String) -> Unit) {
+        viewModelScope.launch {
+            val secret = withContext(Dispatchers.IO) { engine.clientKeyStore.rotate(id) }
+            if (secret != null) onRotated(secret)
+            refresh()
+        }
+    }
+
+    fun resetClientKeyUsage(id: String) {
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) { engine.clientKeyUsage.reset(id) }
+            refresh()
+        }
+    }
+
+    // ------------------------------------------------------------ 路由组 / 价格 / 改写
+
+    fun updateRoutingGroups(updated: dev.aigw.core.gateway.RoutingGroupSettings) {
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) { engine.updateRoutingGroups(updated) }
+            refresh()
+        }
+    }
+
+    fun updatePricing(updated: dev.aigw.core.usage.PricingTable) {
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) { engine.updatePricingTable(updated) }
+            refresh()
+        }
+    }
+
+    fun updateMiddleware(updated: dev.aigw.core.gateway.MiddlewareSettings) {
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) { engine.updateMiddlewareSettings(updated) }
+            refresh()
+        }
+    }
+
     /**
      * 开关「悬浮窗保活」：落盘后立即生效。
      *
@@ -782,6 +940,22 @@ class AppViewModel(
     }
 
     /**
+     * 开关「开机自动恢复」：落盘后由 [dev.aigw.app.service.GatewayBootReceiver] 在
+     * BOOT_COMPLETED / MY_PACKAGE_REPLACED 时读取并拉起前台服务。
+     *
+     * 只影响「下次开机」；当前这次运行不受影响，所以这里不碰服务。
+     */
+    fun setStartOnBoot(enabled: Boolean) {
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) {
+                dev.aigw.app.data.KeepAlivePrefs.setStartOnBoot(engine.store(), enabled)
+            }
+            notice(if (enabled) "已开启：手机重启或应用更新后自动恢复网关" else "已关闭：重启后不会自动恢复网关")
+            refresh()
+        }
+    }
+
+    /**
      * 授权返回后重新应用悬浮窗：仅在网关服务运行时补显示（开关开着且未在显示）。
      */
     fun reapplyOverlayIfEnabled() {
@@ -789,6 +963,23 @@ class AppViewModel(
         if (!dev.aigw.app.data.KeepAlivePrefs.overlayEnabled(engine.store())) return
         if (dev.aigw.app.service.FloatingKeepAlive.isShowing()) return
         dev.aigw.app.service.FloatingKeepAlive.show(app, "网关 ${engine.settings().port}")
+    }
+
+    /**
+     * 开关「实时状态通知」（Android 16 Live Updates）。
+     *
+     * 发布本身由前台服务按在途请求驱动，这里只负责落盘 + 把新开关值同步给通知器：
+     * 关闭时立即撤销正在显示的那条，不必等服务重启。
+     */
+    fun setLiveNotification(enabled: Boolean) {
+        _state.value = _state.value.copy(liveNotification = enabled)
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) {
+                dev.aigw.app.data.KeepAlivePrefs.setLiveNotificationEnabled(engine.store(), enabled)
+            }
+            dev.aigw.app.service.LiveStatusNotifier.setEnabled(app, enabled)
+            notice(if (enabled) "实时状态通知已开启" else "实时状态通知已关闭")
+        }
     }
 
     /** 重新加载反审核脱敏处理链。 */
@@ -921,7 +1112,11 @@ class AppViewModel(
             _state.value = _state.value.copy(busy = "")
             result.fold(
                 onSuccess = { ticket ->
-                    if (!openBrowser(ticket.loginUrl)) {
+                    // 先拉起前台服务再开浏览器：回调端口在本进程里，进程若被判 idle 冻结，
+                    // 授权结果就只能挂在 listen backlog 里没人应答（浏览器一直转圈）
+                    LoginWaitService.start(app)
+                    if (!openLoginPage(ticket.loginUrl)) {
+                        LoginWaitService.stop(app)
                         _state.value = _state.value.copy(notice = "没有可用的浏览器，无法打开登录页")
                         return@fold
                     }
@@ -932,21 +1127,36 @@ class AppViewModel(
                         _state.value = _state.value.copy(notice = "已在浏览器打开登录页，完成后会自动添加账号")
                     }
                 },
-                onFailure = { _state.value = _state.value.copy(notice = it.message ?: "打开登录页失败") },
+                onFailure = {
+                    LoginWaitService.stop(app)
+                    _state.value = _state.value.copy(notice = it.message ?: "打开登录页失败")
+                },
             )
         }
     }
 
     /**
-     * 打开登录页。
+     * 用 Custom Tab 打开登录页，而不是裸 [Intent.ACTION_VIEW]。
      *
-     * 走**系统浏览器**：Trae / Antigravity / WorkBuddy 的登录结果由网关自己的本地回调端口
-     * 或 state 轮询接住，页面在哪打开不影响结果。原先这里改成过内嵌 WebView，
-     * 但状态里没人填 Cookie 域名，登录成功后会卡在「正在保存…」——那条链路已拆除。
+     * 裸 intent 会把登录页甩给外部浏览器，本应用随即被推到后台；Custom Tab 至少与宿主
+     * 保持返回栈关系，观感和返回行为都更接近应用内（rikkahub 也是这么做的）。
+     * 但真正保住回调端口的是 [LoginWaitService] 提供的前台服务级别 —— 只有它能让本进程
+     * 在后台期间不被判 idle 冻结，单靠 Custom Tab 挡不住。
      *
-     * 只在 App 内完成的登录（LongCat / Today 这类「凭证就是 Cookie」的上游）走
-     * [dev.aigw.app.ui.providers.ProviderUiActions.onCookieLogin]，由供应商详情页自己拉起。
+     * 设备上没有 Custom Tab 提供方时退回系统浏览器。
      */
+    private fun openLoginPage(url: String): Boolean {
+        val opened = runCatching {
+            val customTabs = CustomTabsIntent.Builder()
+                .setShowTitle(true)
+                .build()
+            customTabs.intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            customTabs.launchUrl(app, Uri.parse(url))
+            true
+        }.getOrDefault(false)
+        return opened || openBrowser(url)
+    }
+
     private fun openBrowser(url: String): Boolean = runCatching {
         app.startActivity(
             Intent(Intent.ACTION_VIEW, Uri.parse(url)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
@@ -968,10 +1178,8 @@ class AppViewModel(
                     null -> delay(2_000)
                     is DeviceAuthPoll.Pending -> delay(2_000)
                     is DeviceAuthPoll.Success -> {
-                        _state.value = _state.value.copy(
-                            busy = "",
-                            notice = "登录成功：${poll.account.nickname.ifEmpty { poll.account.uid }}",
-                        )
+                        LoginWaitService.stop(app)
+                        _state.value = _state.value.copy(busy = "", notice = "登录成功：${poll.account.nickname.ifEmpty { poll.account.uid }}")
                         refresh()
                         return@launch
                     }
@@ -981,7 +1189,8 @@ class AppViewModel(
                     }
                 }
             }
-            _state.value = _state.value.copy(busy = "")
+            LoginWaitService.stop(app)
+            _state.value = _state.value.copy(busy = "", notice = message)
             refresh()
         }
     }
@@ -1166,14 +1375,6 @@ class AppViewModel(
         "账号已删除"
     }
 
-    /** 调整账号使用优先级（↑/↓）：靠前的先用，同级按余额。 */
-    fun moveAccountPriority(providerId: String, uid: String, up: Boolean) {
-        viewModelScope.launch {
-            withContext(Dispatchers.IO) { engine.moveAccountPriority(providerId, uid, up) }
-            refresh()
-        }
-    }
-
     /** 按保留天数清理过期记录。 */
     fun purgeExpiredRecords() = action {
         val removed = engine.purgeExpiredRecords()
@@ -1189,6 +1390,22 @@ class AppViewModel(
             "已截断 $count 条记录，释放约 ${StorageAudit.formatSize(saved)}"
         }
     }
+
+    /** 调整账号使用优先级（↑/↓）：排在前面的先用，同级仍按余额。 */
+    fun moveAccountPriority(providerId: String, uid: String, up: Boolean) = action {
+        if (!engine.moveAccountPriority(providerId, uid, up)) throw IllegalStateException("已到列表尽头")
+        ""
+    }
+
+    /** 导出账号为 JSON 文本；[selection] 为 `providerId/uid` 集合，空集表示全部。 */
+    fun exportAccountsJson(selection: Set<String>): String = engine.exportAccounts(selection)
+
+    /** 解析导出内容（只读），供导入前预览；格式不对抛错，消息可直接展示。 */
+    fun parseAccountTransfer(json: String) = engine.parseAccountTransfer(json)
+
+    /** 导入勾选的账号；返回逐条结果。 */
+    fun importAccountsJson(json: String, selection: Set<String>, overwrite: Boolean) =
+        engine.importAccounts(json, overwrite, selection)
 
     /**
      * 刷新额度；uid 为空表示刷新该供应商的全部账号。
@@ -1235,42 +1452,68 @@ class AppViewModel(
     /**
      * 对所有支持签到的账号批量签到。
      *
-     * 只签到 Trae 与 WorkBuddy 国内版（cn）：WorkBuddy 国际版（global）与 Trae 国际版
-     * 没有签到制度，跳过可避免每次批量签到都报错。
+     * 目标由供应商自己判定（[Provider.supportsAction]）：WorkBuddy 国际版、Trae 国际版
+     * 本就没有签到制度，选目标时就排掉，不会跑完再报一堆「没有签到」的错。
      * 并发与失败隔离由 [GatewayEngine.performActionAll] 负责；这里只负责选目标与汇总结果。
      */
     fun checkinAll() = runBatch("批量签到") { onProgress ->
-        val targets = engine.providers()
-            .filter { ProviderCapability.CHECKIN in it.capabilities }
-            .flatMap { info -> engine.accounts(info.id) }
-            // 区域型供应商的国际版没有签到制度（Trae INTL / WorkBuddy global），跳过避免整批报错
-            .filter { account -> accountRegion(account.providerId, account.uid) != TraeRegion.INTL.id }
-            .map { BatchTarget(it.providerId, it.uid) }
+        val targets = batchTargets(ACTION_CHECKIN, ProviderCapability.CHECKIN)
         if (targets.isEmpty()) throw IllegalStateException("还没有支持签到的账号")
         engine.performActionAll(targets, ACTION_CHECKIN, onProgress = onProgress)
     }
 
     /**
-     * 对所有支持任务的账号批量执行任务（目前是 Loomy 的新手任务）。
+     * 对所有支持任务的账号批量执行任务（Loomy 的新手任务、WorkBuddy 成长中心）。
      *
-     * Trae / WorkBuddy 的「任务」实际就是每日签到，已由 [checkinAll] 覆盖。
+     * WorkBuddy 侧是「一条龙」：先接单、按官方客户端的口径把未完成的任务推进（上报埋点 /
+     * 真发对话），再统一领已达标的奖励；没配方的任务会在结果里点名。
      * 全部成功时把各账号的上游原话拼进提示（如 Loomy 的领取结果），失败时走结果面板逐条展示。
      */
-    fun runAllTasks() = runBatch(
-        busyText = "批量任务",
-        successNotice = { results ->
-            results.filter { it.message.isNotEmpty() }
-                .joinToString("；") { "${it.nickname.ifEmpty { it.uid }}：${it.message}" }
-                .ifEmpty { "任务完成（${results.size} 个账号）" }
-        },
-    ) { onProgress ->
-        val targets = engine.providers()
-            .filter { ProviderCapability.TASKS in it.capabilities }
-            .flatMap { info -> engine.accounts(info.id) }
-            .map { BatchTarget(it.providerId, it.uid) }
-        if (targets.isEmpty()) throw IllegalStateException("还没有支持任务的账号")
-        engine.performActionAll(targets, ACTION_TASKS, onProgress = onProgress)
+    fun runAllTasks(): Unit {
+        // 任务进度马上会被推进，已缓存的快照就过期了：清掉，账号页下次进入会重新拉
+        _state.value = _state.value.copy(taskLists = emptyMap())
+        runBatch(
+            busyText = "批量任务",
+            successNotice = { results ->
+                results.filter { it.message.isNotEmpty() }
+                    .joinToString("；") { "${it.nickname.ifEmpty { it.uid }}：${it.message}" }
+                    .ifEmpty { "任务完成（${results.size} 个账号）" }
+            },
+        ) { onProgress ->
+            val targets = batchTargets(ACTION_TASKS, ProviderCapability.TASKS)
+            if (targets.isEmpty()) throw IllegalStateException("还没有支持任务的账号")
+            engine.performActionAll(targets, ACTION_TASKS, onProgress = onProgress)
+        }
     }
+
+    /**
+     * 选批量目标：供应商声明支持该能力，且**这个账号**适用该动作。
+     *
+     * 账号级判定交给供应商（区域型供应商的国际版、企业账号本就没有签到/成长中心），
+     * 于是这类账号压根不进入流程，而不是跑完再逐条报错。
+     */
+    private fun batchTargets(action: String, capability: ProviderCapability): List<BatchTarget> =
+        engine.providers()
+            .filter { capability in it.capabilities }
+            .flatMap { info -> engine.accounts(info.id) }
+            .filter { account -> engine.supportsAction(account.providerId, account.uid, action) }
+            .map { BatchTarget(it.providerId, it.uid) }
+
+    /**
+     * 批量动作的可执行目标概览：有哪些供应商、各几个账号会被实际执行。
+     *
+     * 界面用它决定按钮是否可点、并列出「这次会动到谁」——避免用户点下去才看到
+     * 「还没有支持任务的账号」这种无意义报错。
+     */
+    fun batchTargetSummary(action: String, capability: ProviderCapability): List<Pair<String, Int>> =
+        engine.providers()
+            .filter { capability in it.capabilities }
+            .map { info ->
+                val count = engine.accounts(info.id)
+                    .count { engine.supportsAction(it.providerId, it.uid, action) }
+                info.displayName to count
+            }
+            .filter { it.second > 0 }
 
     /**
      * 跑一批批量动作：后台 IO 执行、过程中把进度写回状态、结束后给结构化结果并刷新界面。
@@ -1337,6 +1580,8 @@ class AppViewModel(
     fun performAction(providerId: String, uid: String, action: String, payload: JsonObject = JsonObject()) = action {
         val result: ProviderActionResult = engine.performAction(providerId, uid, action, payload)
         if (!result.ok) throw IllegalStateException(result.message)
+        // 任务进度刚变，账号页里缓存的快照要重拉，否则仍显示「未完成」
+        if (action == ACTION_TASKS) loadTaskList(providerId, uid)
         result.message.ifEmpty { "操作完成" }
     }
 
@@ -1414,8 +1659,6 @@ class AppViewModel(
     }
 
     // ------------------------------------------------------------------ 代理
-
-    fun proxySettings(): ProxySettings = engine.proxySettings()
 
     fun updateProxySettings(settings: ProxySettings) {
         _state.value = _state.value.copy(proxy = settings)
@@ -1655,7 +1898,7 @@ class AppViewModel(
             if (!manual) updateStore.setLastCheckEpochDay(currentEpochDay())
             outcome.fold(
                 onSuccess = { info ->
-                    if (isNewer(info.version, installedVersionName())) {
+                    if (dev.aigw.core.update.isNewerVersion(info.version, installedVersionName())) {
                         _state.value = _state.value.copy(updateInfo = info)
                         // 主动发一条系统通知：autoCheck 只在 App 启动时跑，
                         // 不发通知的话用户不开 App 永远不知道有新版本。
@@ -1689,18 +1932,6 @@ class AppViewModel(
             apkUrl = release.apkUrl,
             apkSize = release.apkSize,
         )
-    }
-
-    /** 逐段比较版本号，远端更大返回 true。 */
-    private fun isNewer(remote: String, local: String): Boolean {
-        val r = remote.split('.', '-').mapNotNull { it.toIntOrNull() }
-        val l = local.split('.', '-').mapNotNull { it.toIntOrNull() }
-        for (i in 0 until maxOf(r.size, l.size)) {
-            val a = r.getOrElse(i) { 0 }
-            val b = l.getOrElse(i) { 0 }
-            if (a != b) return a > b
-        }
-        return false
     }
 
     /** 当前安装的版本名。 */
