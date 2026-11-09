@@ -266,20 +266,25 @@ class LoomyProvider(
             // 别让一个接口的 5xx 把整张额度卡打成一串红字。
             val balanceResult = runCatching { pointsClient.balance(loomy.session) }
             val checkinResult = runCatching { pointsClient.firstLogin(loomy.session) }
-            if (balanceResult.isFailure && checkinResult.isFailure) {
-                // 两个都挂：摆出各自打了哪个接口、什么码，用户截图就能定位
-                val detail = listOf("records" to balanceResult, "first-login" to checkinResult)
-                    .joinToString("；") { (name, r) ->
-                        val e = r.exceptionOrNull()
-                        "$name：${describeFailure(e)}"
-                    }
+            // first-login 「成功」但一个数都没给（空 data）不算可用：拿它兜底只会把错误吞掉
+            val checkin = checkinResult.getOrNull()?.takeIf {
+                it.permanentBalance >= 0 || it.currentBalance >= 0 || it.dailyQuota >= 0
+            }
+            if (balanceResult.isFailure && checkin == null) {
+                val e = balanceResult.exceptionOrNull()
+                // session 失效时两个接口必然一起挂，修复动作只有一个：重新登录。细节没价值。
+                if ((e as? LoomyApiException)?.kind == LoomyErrorKind.SESSION_DEAD) {
+                    return CreditInfo(0, known = false, detail = "登录状态已失效，需要重新登录")
+                }
+                // 其余情况（上游 5xx 等）摆出各自打了哪个接口、什么码，用户截图就能定位
+                val detail = "records：${describeFailure(e)}；first-login：${describeFailure(checkinResult.exceptionOrNull())}"
                 return CreditInfo(0, known = false, detail = "积分接口不可用（$detail）")
             }
             var degraded = ""
-            val snapshot = balanceResult.getOrElse { e ->
+            val snapshot = if (balanceResult.isFailure) {
                 // records 挂、first-login 活：用 first-login 的全量口径拼一份快照
-                val c = checkinResult.getOrThrow()
-                degraded = "records 接口异常（${describeFailure(e)}），余额取自 first-login"
+                val c = checkin!!
+                degraded = "records 接口异常（${describeFailure(balanceResult.exceptionOrNull())}），余额取自 first-login"
                 PointsSnapshot(
                     personal = c.permanentBalance,
                     team = -1L,
@@ -289,9 +294,9 @@ class LoomyProvider(
                     dailyBalance = c.dailyBalance,
                     personalRaw = "first-login fallback",
                 )
+            } else {
+                balanceResult.getOrThrow()
             }
-            // records 活、first-login 挂：照常展示主账本，只是每日明细缺席（下面的 checkinDetail 为 null）
-            val checkin = checkinResult.getOrNull()
             // 对话扣的是当日赠送账本（实测会随消耗下降），而 balance 字段是永久账本不动；
             // 可用总余额 = 主账本 + 当日剩余，两者都来自 records。
             // 当日剩余的取值必须与 creditPacks 的「当日赠送」行完全一致：
