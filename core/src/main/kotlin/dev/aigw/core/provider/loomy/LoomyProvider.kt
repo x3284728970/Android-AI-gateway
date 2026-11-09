@@ -262,7 +262,36 @@ class LoomyProvider(
         val loomy = parseOrNull(account)
             ?: throw IllegalStateException("账号凭证无法解析，请重新登录")
         return try {
-            val snapshot = pointsClient.balance(loomy.session)
+            // 两个数据源独立拉：records（个人账本）挂了还有 first-login（全量口径）兜底，
+            // 别让一个接口的 5xx 把整张额度卡打成一串红字。
+            val balanceResult = runCatching { pointsClient.balance(loomy.session) }
+            val checkinResult = runCatching { pointsClient.firstLogin(loomy.session) }
+            if (balanceResult.isFailure && checkinResult.isFailure) {
+                // 两个都挂：摆出各自打了哪个接口、什么码，用户截图就能定位
+                val detail = listOf("records" to balanceResult, "first-login" to checkinResult)
+                    .joinToString("；") { (name, r) ->
+                        val e = r.exceptionOrNull()
+                        "$name：${describeFailure(e)}"
+                    }
+                return CreditInfo(0, known = false, detail = "积分接口不可用（$detail）")
+            }
+            var degraded = ""
+            val snapshot = balanceResult.getOrElse { e ->
+                // records 挂、first-login 活：用 first-login 的全量口径拼一份快照
+                val c = checkinResult.getOrThrow()
+                degraded = "records 接口异常（${describeFailure(e)}），余额取自 first-login"
+                PointsSnapshot(
+                    personal = c.permanentBalance,
+                    team = -1L,
+                    dailyRemaining = -1L,
+                    dailyLimit = c.dailyQuota,
+                    dailyConsumed = c.dailyConsumed,
+                    dailyBalance = c.dailyBalance,
+                    personalRaw = "first-login fallback",
+                )
+            }
+            // records 活、first-login 挂：照常展示主账本，只是每日明细缺席（下面的 checkinDetail 为 null）
+            val checkin = checkinResult.getOrNull()
             // 对话扣的是当日赠送账本（实测会随消耗下降），而 balance 字段是永久账本不动；
             // 可用总余额 = 主账本 + 当日剩余，两者都来自 records。
             // 当日剩余的取值必须与 creditPacks 的「当日赠送」行完全一致：
@@ -278,7 +307,6 @@ class LoomyProvider(
             // first-login 给（rsfree 实证：只读 records，「每日赠送额度/当日已用」恒为空）。
             // first-login 幂等且官方客户端每次启动都调——每次刷额度顺手调一次，漏了它
             // 当日 5000 赠送可能静默拿不到。
-            val checkin = runCatching { pointsClient.firstLogin(loomy.session) }.getOrNull()
             val checkinDetail = checkin?.takeIf { it.dailyQuota > 0 }?.let {
                 val dailyLeft = if (it.dailyBalance >= 0) it.dailyBalance else it.dailyQuota - it.dailyConsumed
                 "，每日额度 $dailyLeft/${it.dailyQuota}" + if (it.cycleDate.isNotEmpty()) "（${it.cycleDate}）" else ""
@@ -287,15 +315,36 @@ class LoomyProvider(
                 balance = snapshot.balance + daily,
                 known = snapshot.known,
                 detail = when {
-                    snapshot.known -> "${snapshot.source}=${snapshot.balance}，当日剩余=${formatOrDash(if (daily > 0) daily else -1L)}$checkinDetail"
+                    snapshot.known ->
+                        "${snapshot.source}=${snapshot.balance}，当日剩余=${formatOrDash(if (daily > 0) daily else -1L)}$checkinDetail" +
+                            (if (degraded.isNotEmpty()) "；$degraded" else "")
                     // 两个账本都没拿到数：带响应片段，便于区分 session 失效与接口口径变化
                     else -> "未取到余额（响应片段：${snapshot.personalRaw.take(120)}）"
                 },
             )
-        } catch (e: LoomyApiException) {
-            CreditInfo(0, known = false, detail = e.message ?: "刷新积分失败")
         } catch (e: Exception) {
-            CreditInfo(0, known = false, detail = e.message ?: "刷新积分失败")
+            CreditInfo(0, known = false, detail = describeFailure(e))
+        }
+    }
+
+    /**
+     * 失败细节一行话：上游的 desc（用户能看懂的）+ HTTP 码 + 业务码 + trace_id。
+     *
+     * 「系统内部错误」这类上游 5xx 只有 trace_id 才有排查价值——客服/后端都靠它定位。
+     */
+    private fun describeFailure(e: Throwable?): String {
+        if (e == null) return "未知错误"
+        val base = e.message?.takeIf { it.isNotBlank() } ?: e.javaClass.simpleName
+        if (e !is LoomyApiException) return base
+        val trace = runCatching {
+            JsonParser.parseString(e.body).asJsonObject.get("trace_id")?.takeIf { it.isJsonPrimitive }?.asString
+        }.getOrNull().orEmpty()
+        return buildString {
+            append(base)
+            append("（HTTP ${e.status}")
+            if (e.upstreamCode.isNotEmpty()) append(" code=${e.upstreamCode}")
+            if (trace.isNotEmpty()) append(" trace=$trace")
+            append("）")
         }
     }
 
