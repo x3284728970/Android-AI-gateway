@@ -55,7 +55,17 @@ jobs:
         run: gradle :core:test :app:testReleaseUnitTest --console=plain
 
       - name: 打包 release
-        run: gradle :app:assembleRelease --console=plain
+        # Maven Central 偶发 429（限流），重试三次再判失败：
+        # compose-group-mapping 这类只在打包阶段解析的依赖最容易撞上。
+        run: |
+          for attempt in 1 2 3; do
+            if gradle :app:assembleRelease --console=plain; then
+              exit 0
+            fi
+            echo "::warning::assembleRelease 第 $attempt 次失败，10s 后重试"
+            sleep 10
+          done
+          exit 1
 
       - name: 读取版本号
         id: version
