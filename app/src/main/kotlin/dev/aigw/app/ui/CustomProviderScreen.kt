@@ -2,16 +2,18 @@ package dev.aigw.app.ui
 
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.size
-import androidx.compose.material.icons.Icons
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.CloudDownload
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
+import androidx.compose.material.icons.Icons
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -28,7 +30,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import dev.aigw.core.gateway.CustomProviderConfig
+import dev.aigw.core.provider.custom.CustomPresets
 import dev.aigw.core.provider.custom.CustomProvider
+
 
 /**
  * 自定义供应商的新建/编辑。
@@ -36,7 +40,7 @@ import dev.aigw.core.provider.custom.CustomProvider
  * 一屏填完三件事：连得上（地址 + Key）、看得见模型（拉取或手填）、存得下（名称与短名）。
  * 老流程把 Key 与模型留到详情页才可填，用户保存完拿到的是一个 0 账号、用不了的供应商。
  */
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun CustomProviderScreen(
     existing: CustomProviderConfig?,
@@ -58,6 +62,8 @@ fun CustomProviderScreen(
     var fetchError by remember { mutableStateOf("") }
     var fetching by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf("") }
+    // 选中的预设：只用于展示说明，用户改动字段后仍保留（方便对照）
+    var presetId by remember { mutableStateOf("") }
 
     val baseUrlValue = baseUrl.trim()
     val normalizedBase = remember(baseUrlValue) { CustomProvider.normalizeBaseUrl(baseUrlValue) }
@@ -76,6 +82,42 @@ fun CustomProviderScreen(
             )
         },
     ) {
+        // 新建时给一排预设：Key 型渠道填地址这一步最容易错（每家都差一个 /v1 或 /v4），
+        // 点一下就能拿到正确的地址与模型前缀，剩下的只是粘 Key。
+        if (existing == null) {
+            SectionCard {
+                SectionLabel("快速预设")
+                FlowRow(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    CustomPresets.ALL.forEach { preset ->
+                        ChoiceChip(
+                            text = preset.name,
+                            selected = presetId == preset.id,
+                            onClick = {
+                                presetId = preset.id
+                                name = preset.name
+                                key = preset.id
+                                keyEdited = true
+                                baseUrl = preset.baseUrl
+                                if (preset.models.isNotEmpty()) modelsText = preset.models.joinToString("\n")
+                                fetchError = ""
+                            },
+                        )
+                    }
+                }
+                CustomPresets.byId(presetId)?.let { preset ->
+                    Text(
+                        text = preset.note,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        }
+
         SectionCard {
             SectionLabel("连接")
             OutlinedTextField(

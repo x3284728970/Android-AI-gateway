@@ -4,11 +4,9 @@ import dev.aigw.core.provider.ProviderRegistry
 import dev.aigw.core.provider.antigravity.AntigravityProvider
 import dev.aigw.core.provider.chatgpt.ChatGPTProvider
 import dev.aigw.core.provider.codebuddy.CodeBuddyProvider
-import dev.aigw.core.provider.dumate.DumateProvider
+import dev.aigw.core.provider.copilot.CopilotProvider
 import dev.aigw.core.provider.loomy.LoomyProvider
 import dev.aigw.core.provider.longcat.LongCatProvider
-import dev.aigw.core.provider.qoder.QoderProvider
-import dev.aigw.core.provider.qwenwork.QwenProvider
 import dev.aigw.core.provider.raccoon.RaccoonProvider
 import dev.aigw.core.provider.today.TodayProvider
 import dev.aigw.core.provider.trae.TraeConstants
@@ -74,6 +72,12 @@ internal fun registerBuiltinProviders(engine: GatewayEngine) {
     )
 
     registry.register(
+        CopilotProvider(
+            nowMillis = { engine.now() },
+        ),
+    )
+
+    registry.register(
         RaccoonProvider(
             hooks = engine.hooks,
             nowMillis = { engine.now() },
@@ -82,24 +86,6 @@ internal fun registerBuiltinProviders(engine: GatewayEngine) {
 
     registry.register(
         LongCatProvider(
-            nowMillis = { engine.now() },
-        ),
-    )
-
-    registry.register(
-        DumateProvider(
-            nowMillis = { engine.now() },
-        ),
-    )
-
-    registry.register(
-        QwenProvider(
-            nowMillis = { engine.now() },
-        ),
-    )
-
-    registry.register(
-        QoderProvider(
             nowMillis = { engine.now() },
         ),
     )

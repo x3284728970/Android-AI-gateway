@@ -59,7 +59,6 @@ fun ProviderDetailScreen(
     val context = LocalContext.current
     var pendingCookieProvider by remember { mutableStateOf("") }
     // 页内积分（搭子）：记住这次是给哪个供应商执行的
-    var pendingInPagePoints by remember { mutableStateOf("") }
     val cookieLogin = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult(),
     ) { result ->
@@ -77,22 +76,6 @@ fun ProviderDetailScreen(
             viewModel.importCredentials(target, json)
         }
         pendingCookieProvider = ""
-    }
-
-    val inPagePoints = rememberLauncherForActivityResult(
-        ActivityResultContracts.StartActivityForResult(),
-    ) { result ->
-        val target = pendingInPagePoints
-        pendingInPagePoints = ""
-        if (result.resultCode != Activity.RESULT_OK || target.isEmpty()) {
-            return@rememberLauncherForActivityResult
-        }
-        val message = result.data
-            ?.getStringExtra(DumatePointsActivity.EXTRA_RESULT_MESSAGE)
-            .orEmpty()
-        if (message.isNotEmpty()) viewModel.notice(message)
-        // 余额/签到状态变了，让卡片重拉一次（额度数字在 notice 里展示）
-        viewModel.refresh()
     }
 
     // 缓存回调集合：30+ 个 lambda 每次重组重建会让账号卡片永远无法跳过重组。
@@ -163,10 +146,6 @@ fun ProviderDetailScreen(
             },
             onRefreshCredits = { id, uid -> viewModel.refreshCredits(id, uid) },
             onAction = { id, uid, action, payload -> viewModel.performAction(id, uid, action, payload) },
-            onInPagePoints = { id, uid ->
-                pendingInPagePoints = id
-                inPagePoints.launch(Intent(context, DumatePointsActivity::class.java))
-            },
             onToggleAccount = { id, uid, enabled -> viewModel.setAccountEnabled(id, uid, enabled) },
             onRemoveAccount = { id, uid -> viewModel.removeAccount(id, uid) },
             onMoveAccountPriority = { id, uid, up -> viewModel.moveAccountPriority(id, uid, up) },

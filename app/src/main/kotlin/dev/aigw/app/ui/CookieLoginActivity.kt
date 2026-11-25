@@ -45,18 +45,15 @@ class CookieLoginActivity : Activity() {
     /**
      * 一键复制全部 Cookie 到剪贴板。
      *
-     * WebView 登录链走不完时（如百度搭子的 bce-sessionid 在跳转链最后一跳才种上，
-     * 而 WebView 对那段流程要么拦跨域、要么 UA 分流不种），用户可以直接复制全部 Cookie
-     * 自己粘贴导入。点「完成」走的是 collectAndFinish（只收 hosts 列表里的域），
+     * WebView 登录链走不完时，用户可以直接复制全部 Cookie 自己粘贴导入。
+     * 点「完成」走的是 collectAndFinish（只收 hosts 列表里的域），
      * 但有些 cookie 落在别的子域，逐域读可能漏掉——这里从 CookieManager 一次性取全部。
      */
     private fun copyCookiesToClipboard() {
         val manager = CookieManager.getInstance()
         manager.flush()
         // 已知域 + 常见父域/子域，一次性扫全
-        val allHosts = pendingHosts.toList() +
-            listOf("dumate.baidu.com", "baidu.com", ".baidu.com", "console.bce.baidu.com",
-                "www.dumate.cn", "dumate.cn", "passport.baidu.com")
+        val allHosts = pendingHosts.toList()
         val seen = LinkedHashSet<String>()
         val pairs = mutableListOf<String>()
         for (host in allHosts) {
@@ -75,7 +72,7 @@ class CookieLoginActivity : Activity() {
         }
         val cookieStr = pairs.joinToString("; ")
         val clipboard = getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
-        clipboard.setPrimaryClip(android.content.ClipData.newPlainText("DuMate Cookie", cookieStr))
+        clipboard.setPrimaryClip(android.content.ClipData.newPlainText("登录 Cookie", cookieStr))
         Toast.makeText(this, "Cookie 已复制（${pairs.size} 条），去粘贴导入", Toast.LENGTH_LONG).show()
     }
 
@@ -103,24 +100,19 @@ class CookieLoginActivity : Activity() {
     /**
      * 登录成功后必须**主动访问一次**的域名（用于让服务端种下跨域会话 cookie）。
      *
-     * 百度搭子实证：`bce-sessionid` / `bce-long-term-sessionid` 只有在真正访问
-     * `console.bce.baidu.com` 时才由服务端下发；只在 dumate 域登录永远拿不到，
-     * 而调 `/api/dumate/` 下所有接口恰恰依赖它（缺了一律 401）。
-     * 参考实现 dumate2api/src/login-browser.js 的 SETTLE_URLS 就是这个用途。
+     * 有些会话 cookie 只在访问另一个（跨域）主机时才由服务端下发，
+     * 只在登录域停留永远拿不到，而调业务接口恰恰依赖它（缺了一律 401）。
      */
     private var settleUrls: List<String> = emptyList()
     /** 已经跳过一次 settle 页面，避免反复刷新。 */
     private var settleIndex = 0
 
     /**
-     * **页面内换票**模式用的接口路径（如 `/api/dumate/app/token/get`）。
+     * **页面内换票**模式用的接口路径。
      *
-     * 非空时不再靠「关键 Cookie 出现」判断登录完成：百度 passport 的会话 cookie
-     * （`BDUSS` / `bce-long-term-sessionid`）是 **HttpOnly**，`CookieManager.getCookie()`
-     * 读不到，导出的 cookie 串永远缺这几项，服务端一律回 401「登录态已失效」。
+     * 非空时不再靠「关键 Cookie 出现」判断登录完成：会话 cookie 可能是 **HttpOnly**，
+     * `CookieManager.getCookie()` 读不到，导出的 cookie 串永远缺这几项，服务端一律 401。
      * 改为在页面里发同源请求——HttpOnly cookie 由 WebView 自动带上——直接把票取回来。
-     * 参考实现（dumate2api 的 login-browser.js）用的是 Playwright 的 ctx.cookies()，
-     * 那个能读到 HttpOnly，所以它能成；我们照抄「导出 cookie 再换票」这条路必然不成。
      */
     private var tokenEndpoint: String = ""
 
@@ -513,7 +505,7 @@ class CookieLoginActivity : Activity() {
     private fun collectAndFinish(hosts: Array<String>, fromAuto: Boolean) {
         val manager = CookieManager.getInstance()
         manager.flush()
-        // 逐 host 收集后**按键去重**：子域与父域各有一份同名 cookie（如 dumate.baidu.com
+        // 逐 host 收集后**按键去重**：子域与父域各有一份同名 cookie（如 a.example.com
         // 与 .baidu.com 的 sessionid），拼在一起服务端拿到两份同名键、行为不确定。
         // 保留先出现的（hosts 列表里具体域在前、父域在后）。
         val seenKeys = LinkedHashSet<String>()
@@ -644,7 +636,7 @@ class CookieLoginActivity : Activity() {
         const val EXTRA_COOKIE_HOSTS = "cookie_hosts"
         const val EXTRA_SETTLE_URLS = "settle_urls"
 
-        /** 页面内换票的接口路径（同源相对路径，如 `/api/dumate/app/token/get`）。 */
+        /** 页面内换票的接口路径（同源相对路径）。 */
         const val EXTRA_TOKEN_ENDPOINT = "token_endpoint"
 
         /** 换票前要落到的页面（决定请求的 Origin）。 */
