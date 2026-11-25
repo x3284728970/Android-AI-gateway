@@ -159,15 +159,23 @@ class TraeProvider(
      *
      * 只列网关自己会出站访问的 host（agent / 额度 / 鉴权）：登录页由系统浏览器打开，不走这里。
      */
-    override fun hosts(): List<String> =
-        TraeRegion.entries
-            .flatMap { region ->
-                // 国际版有新加坡/美区两套 host，两个都要列（代理分流漏掉一个就会绕过开关）
-                listOf("", "US-East").flatMap { userRegion ->
-                    val up = TraeUpstream.of(region, userRegion)
-                    listOf(up.chatHost, up.ugHost, up.authHost)
-                }
-            }
+    override fun hosts(): List<String> = TraeRegion.entries
+        .flatMap { regionHosts(it) }
+        .distinct()
+
+    override fun hosts(region: String?): List<String> {
+        val target = TraeRegion.entries.firstOrNull { it.id.equals(region?.trim(), ignoreCase = true) }
+            ?: return hosts()
+        return regionHosts(target)
+    }
+
+    private fun regionHosts(region: TraeRegion): List<String> =
+        // 国际版有两套站点（新加坡 / 美东），同一份凭证两种都可能打到；
+        // 只列一套会让代理分流绕过开关，所以两套都列。
+        listOf("", "US-East").flatMap { userRegion ->
+            val up = TraeUpstream.of(region, userRegion)
+            listOf(up.chatHost, up.ugHost, up.authHost)
+        }
             .map { it.removePrefix("https://") }
             .distinct()
 
@@ -468,6 +476,8 @@ class TraeProvider(
                 )
             }
         } catch (e: Exception) {
+            // 拉不到额度包就返回空表，但要留原因：空表与「真的没有额度包」长得一样
+            hooks.onLog("Trae 拉取额度包失败：${e.message ?: "未知错误"}")
             emptyList()
         }
     }
@@ -506,11 +516,18 @@ class TraeProvider(
 
     // ------------------------------------------------------------------ 登录
 
-    /** 进行中的登录 traceId → 设备指纹；同一进程内回调直接命中，限容防止长期累积。 */
-    private val pending = object : LinkedHashMap<String, Pair<String, String>>() {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Pair<String, String>>): Boolean =
+    /** 进行中的登录 traceId → 设备指纹与所选区域；同一进程内回调直接命中，限容防止长期累积。 */
+    private val pending = object : LinkedHashMap<String, PendingLogin>() {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, PendingLogin>): Boolean =
             size > MAX_PENDING
     }
+
+    /** 一次未完成的登录：设备指纹必须与登录时一致，区域决定后续换 token 打哪个站点。 */
+    private class PendingLogin(
+        val machineId: String,
+        val deviceId: String,
+        val region: TraeRegion,
+    )
 
     /** pending 指纹的持久化键；进程被杀后由 [resolveMachine] 从 store 找回。 */
     private fun pendingKey(traceId: String): String = "login/pending/trae/$traceId"
@@ -522,14 +539,15 @@ class TraeProvider(
         val deviceId = TraeLogin.randomDeviceId()
         val traceId = TraeLogin.machineTraceId(machineId, deviceId)
         synchronized(pending) {
-            pending[traceId] = machineId to deviceId
+            pending[traceId] = PendingLogin(machineId, deviceId, target)
         }
-        // 同时落盘：进程被杀或回调晚到时，仍能拿回与登录一致的设备指纹
+        // 同时落盘：进程被杀或回调晚到时，仍能拿回与登录一致的设备指纹与区域
         store.write(
             pendingKey(traceId),
             JsonObject().apply {
                 addProperty("machineId", machineId)
                 addProperty("deviceId", deviceId)
+                addProperty("region", target.id)
                 addProperty("at", nowMillis())
             }.toString(),
         )
@@ -544,11 +562,9 @@ class TraeProvider(
         val callback = TraeLogin.parseCallback(callbackUrl)
         val traceId = queryParam(callbackUrl, "loginTraceID")
         val machine = resolveMachine(traceId)
-        // 回调里的 loginHost / 回调域名能区分发行版；拿不到就按国内版处理
-        val region = TraeRegion.infer(
-            queryParam(callbackUrl, "loginHost"),
-            callback.enterpriseId.ifEmpty { queryParam(callbackUrl, "host") },
-        )
+        // 区域以用户点登录时选的那个为准：回调里不一定带 loginHost，猜错就会把换 token
+        // 的请求发到另一家站点（国际版账号打到 api.trae.com.cn 必然失败）。
+        val region = resolveCallbackRegion(callbackUrl)
         var account = TraeAccount(
             uid = callback.uid,
             accessToken = callback.accessToken,
@@ -556,8 +572,8 @@ class TraeProvider(
             expiresAt = callback.expiresAt,
             nickname = callback.nickname,
             enterpriseId = callback.enterpriseId,
-            machineId = machine?.first ?: TraeLogin.newMachineId(),
-            deviceId = machine?.second ?: TraeLogin.randomDeviceId(),
+            machineId = machine?.machineId ?: TraeLogin.newMachineId(),
+            deviceId = machine?.deviceId ?: TraeLogin.randomDeviceId(),
             domain = region.id,
             apiHost = region.oauthHost,
         )
@@ -590,14 +606,17 @@ class TraeProvider(
      * 找不回来意味着凭证的设备指纹与注册设备不一致（UG 接口会以 9074 拒绝签到），
      * 所以只做查找，不静默换新的。
      */
-    private fun resolveMachine(traceId: String?): Pair<String, String>? {
+    private fun resolveMachine(traceId: String?): PendingLogin? {
         if (traceId.isNullOrEmpty()) return null
         synchronized(pending) { pending[traceId] }?.let { return it }
         val raw = store.read(pendingKey(traceId)) ?: return null
         val obj = runCatching { JsonParser.parseString(raw).asJsonObject }.getOrNull() ?: return null
         val machineId = obj.get("machineId")?.asString.orEmpty()
         val deviceId = obj.get("deviceId")?.asString.orEmpty()
-        return if (machineId.isEmpty() || deviceId.isEmpty()) null else machineId to deviceId
+        if (machineId.isEmpty() || deviceId.isEmpty()) return null
+        // 旧版本落盘的 pending 没有 region：按国内版处理，与当时的登录行为一致
+        val region = TraeRegion.of(obj.get("region")?.asString)
+        return PendingLogin(machineId, deviceId, region)
     }
 
     // ------------------------------------------------------------------ 工具
@@ -615,6 +634,23 @@ class TraeProvider(
             }
             else -> Unit
         }
+    }
+
+    /**
+     * 用回调链接判定该走哪个站点：优先取登录时选的区域，取不到再看回调参数。
+     *
+     * 回调里不一定带 `loginHost`，而换 token 的站点选错就是登录失败，
+     * 所以这层判定单独暴露给测试锁定。
+     */
+    internal fun resolveCallbackRegion(callbackUrl: String): TraeRegion {
+        val traceId = queryParam(callbackUrl, "loginTraceID")
+        resolveMachine(traceId)?.let { return it.region }
+        // 旧版回调里会把租户域名放在 host 参数；loginHost 缺省时用它判区域
+        val hosts = listOfNotNull(
+            queryParam(callbackUrl, "loginHost"),
+            queryParam(callbackUrl, "host"),
+        ).filter { it.isNotEmpty() }
+        return TraeRegion.infer(hosts.firstOrNull(), hosts.getOrNull(1))
     }
 
     private fun toProviderAccount(account: TraeAccount): ProviderAccount =

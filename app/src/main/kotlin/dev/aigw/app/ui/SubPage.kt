@@ -39,6 +39,9 @@ sealed interface SubPage {
     /** 外观主题：明暗模式、配色方案与金色文字。 */
     data object AppearanceTheme : SubPage
 
+    /** 主题设置：明暗模式、配色、底栏样式集中入口。 */
+    data object ThemeSettings : SubPage
+
     /** 账号导入导出：备份与迁移（含明文凭证）。 */
     data object AccountTransfer : SubPage
 
@@ -53,4 +56,7 @@ sealed interface SubPage {
 
     /** 请求改写：模型别名、system 追加与思考标签清理。 */
     data object RequestRewrite : SubPage
+
+    /** 崩溃日志：应用异常退出时的堆栈记录。 */
+    data object CrashLog : SubPage
 }

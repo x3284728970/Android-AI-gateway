@@ -20,8 +20,13 @@ jobs:
           java-version: '21'
 
       - uses: android-actions/setup-android@v4
+        with:
+          # 与 android-release.yml 保持一致：compileSdk 37 起必须显式装平台包
+          packages: 'platform-tools platforms;android-37.0 build-tools;36.0.0'
 
       - uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: '9.9.1'
 
       - name: 准备 sdk 与 keystore 占位
         run: |

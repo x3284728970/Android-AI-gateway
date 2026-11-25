@@ -19,6 +19,7 @@ import dev.aigw.app.data.KeepAlive
 import dev.aigw.app.data.KeepAliveStatus
 import dev.aigw.app.data.UpdateNotifier
 import dev.aigw.app.gatewayEngine
+import dev.aigw.app.updateApkDir
 import dev.aigw.app.ui.theme.ThemeMode
 import dev.aigw.app.ui.theme.defaultAppColors
 import dev.aigw.app.ui.theme.formatHex
@@ -39,7 +40,10 @@ import dev.aigw.core.gateway.ModelsCatalog
 import dev.aigw.core.gateway.ProviderInfo
 import dev.aigw.core.gateway.ProviderModelsChunk
 import dev.aigw.core.gateway.ProviderSettings
+import dev.aigw.core.gateway.ProxyProfile
+import dev.aigw.core.gateway.ProxyProbeResult
 import dev.aigw.core.gateway.ProxySettings
+import dev.aigw.core.gateway.ProxyTarget
 import dev.aigw.core.pool.AccountStatus
 import dev.aigw.core.pool.PoolSummary
 import dev.aigw.core.provider.ACTION_CHECKIN
@@ -136,6 +140,19 @@ class AppearanceStore(private val store: KeyValueStore) {
         store.delete(KEY_BG)
         store.delete(KEY_GOLD_START)
         store.delete(KEY_GOLD_END)
+        store.delete(KEY_FLOATING_NAV)
+    }
+
+    /**
+     * 底部导航悬浮样式开关：默认**关闭**。
+     *
+     * 跟动态取色一样属于主题的一部分，所以放在同页；但默认关：贴边底栏是默认布局，
+     * 悬浮是可选项，不应该因为升级就改变用户已习惯的位置。
+     */
+    fun floatingNavBar(): Boolean = store.read(KEY_FLOATING_NAV) == "1"
+
+    fun setFloatingNavBar(enabled: Boolean) {
+        store.write(KEY_FLOATING_NAV, if (enabled) "1" else "0")
     }
 
     companion object {
@@ -147,6 +164,7 @@ class AppearanceStore(private val store: KeyValueStore) {
         private const val KEY_BG = "settings/appearance.backgroundHex"
         private const val KEY_GOLD_START = "settings/appearance.goldStartHex"
         private const val KEY_GOLD_END = "settings/appearance.goldEndHex"
+        private const val KEY_FLOATING_NAV = "settings/appearance.floatingNavBar"
     }
 }
 
@@ -203,6 +221,12 @@ sealed interface ModelTestStatus {
     data object Testing : ModelTestStatus
     data class Success(val latencyMs: Long) : ModelTestStatus
     data class Failed(val reason: String) : ModelTestStatus
+}
+
+/** 代理连通性测试状态（键为配置 id，见 [AppUiState.proxyProbeResults]）。 */
+sealed interface ProxyProbeState {
+    data object Testing : ProxyProbeState
+    data class Done(val result: ProxyProbeResult) : ProxyProbeState
 }
 
 /**
@@ -273,6 +297,10 @@ data class AppUiState(
     val modelLoadStates: Map<String, ModelLoadState> = emptyMap(),
     /** 模型测速状态，键为 `model.fullId`。 */
     val modelTestLatencies: Map<String, ModelTestStatus> = emptyMap(),
+    /** 代理页的候选路由（供应商或供应商×区域），启动与供应商变动后刷新。 */
+    val proxyTargets: List<ProxyTarget> = emptyList(),
+    /** 代理连通性测试结果，键为配置 id。 */
+    val proxyProbeResults: Map<String, ProxyProbeState> = emptyMap(),
     val calls: List<CallRecord> = emptyList(),
     /** 存储中的记录条数（含未载入内存的）。 */
     val storedCalls: Int = 0,
@@ -312,6 +340,8 @@ data class AppUiState(
     val failover: dev.aigw.core.failover.ModelFailoverSettings = dev.aigw.core.failover.ModelFailoverSettings(),
     /** 出网取证记录列表。 */
     val evidences: List<dev.aigw.core.security.OutboundEvidence> = emptyList(),
+    /** 风控提示词替换的命中记录。 */
+    val promptRewriteEvidences: List<dev.aigw.core.security.PromptRewriteEvidence> = emptyList(),
     val busy: String = "",
     val notice: String = "",
     /** 批量动作进行中的进度；非空时 UI 显示「已完成 X/N（当前：某账号）」。 */
@@ -340,6 +370,12 @@ data class AppUiState(
     val middleware: dev.aigw.core.gateway.MiddlewareSettings = dev.aigw.core.gateway.MiddlewareSettings(),
     /** 各改写中间件最近一次失败原因，键为中间件 id。 */
     val middlewareFailures: Map<String, String> = emptyMap(),
+    /** 首页组件顺序（含被隐藏的项，隐藏态看 [homeHidden]）。 */
+    val homeOrder: List<HomeWidget> = HomeWidget.entries,
+    /** 首页被隐藏的组件。 */
+    val homeHidden: Set<HomeWidget> = emptySet(),
+    /** 底部导航是否悬浮（主题设置里的开关，默认关闭）。 */
+    val floatingNavBar: Boolean = false,
 ) {
     /** 某个供应商的账号。 */
     fun accountsOf(providerId: String): List<AccountStatus> = accounts.filter { it.providerId == providerId }
@@ -365,9 +401,12 @@ private class Snapshot(
     val logs: List<LogLine>,
     val settings: GatewaySettings,
     val proxy: ProxySettings,
+    val proxyTargets: List<ProxyTarget>,
     val keepAlive: KeepAliveStatus,
     val security: dev.aigw.core.security.SecuritySettings,
     val evidences: List<dev.aigw.core.security.OutboundEvidence>,
+    /** 风控提示词替换的命中记录。 */
+    val promptRewriteEvidences: List<dev.aigw.core.security.PromptRewriteEvidence> = emptyList(),
     val modelExposure: dev.aigw.core.gateway.ModelExposureSettings,
     val failover: dev.aigw.core.failover.ModelFailoverSettings,
     val overlayKeepAlive: Boolean,
@@ -388,6 +427,7 @@ class AppViewModel(
 
     private val appearance = AppearanceStore(engine.store())
     private val updateStore = UpdateStore(engine.store())
+    private val homeLayout = HomeLayoutStore(engine.store())
 
     private val _state = MutableStateFlow(
         AppUiState(
@@ -398,6 +438,9 @@ class AppViewModel(
             backgroundOverride = appearance.backgroundHex()?.let { parseHexColor(it) },
             goldStart = parseHexColor(appearance.goldStartHex()) ?: defaultAppColors.goldStart,
             goldEnd = parseHexColor(appearance.goldEndHex()) ?: defaultAppColors.goldEnd,
+            homeOrder = homeLayout.order(),
+            homeHidden = homeLayout.hidden(),
+            floatingNavBar = appearance.floatingNavBar(),
         ),
     )
     val state: StateFlow<AppUiState> = _state.asStateFlow()
@@ -428,6 +471,7 @@ class AppViewModel(
     @Volatile
     private var modelsFetchedAt = 0L
 
+    /** 在途请求快照签名：只在内容真正变化时写入 state，避免每帧重组拓扑卡。 */
     private var lastActiveSignature = ""
     private val activeRequestsListener: (List<dev.aigw.core.gateway.ActiveRequest>) -> Unit = { list ->
         val sig = list.joinToString(";") { "${it.id}:${it.providerId}:${it.phase}" }
@@ -477,6 +521,14 @@ class AppViewModel(
             if (moved > 0) refresh()
         }
         maybeAutoCheckUpdate()
+        // 冷启动也判一次每日签到：被 force-stop 清掉粘性服务时，服务节拍可能整天都没机会跑。
+        // 与 GatewayService 侧的巡检共用同一个引擎实例，CAS + 台账保证不会重复。
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching {
+                val auto = engine.autoCheckin
+                if (auto.shouldRun()) auto.tick()
+            }
+        }
     }
 
     private fun accountSignature(accounts: List<AccountStatus>): String =
@@ -511,9 +563,11 @@ class AppViewModel(
                     logs = engine.requestLog.lines(),
                     settings = engine.settings(),
                     proxy = engine.proxySettings(),
+                    proxyTargets = engine.proxyTargets(),
                     keepAlive = KeepAlive.status(app),
                     security = engine.securitySettings(),
                     evidences = engine.sanitizer.evidenceList(),
+                    promptRewriteEvidences = engine.promptRewriter.evidenceList(),
                     modelExposure = engine.modelExposureSettings(),
                     failover = engine.failoverSettings(),
                     overlayKeepAlive = dev.aigw.app.data.KeepAlivePrefs.overlayEnabled(engine.store()),
@@ -545,9 +599,11 @@ class AppViewModel(
                 logs = snapshot.logs,
                 settings = snapshot.settings,
                 proxy = snapshot.proxy,
+                proxyTargets = snapshot.proxyTargets,
                 keepAlive = snapshot.keepAlive,
                 security = snapshot.security,
                 evidences = snapshot.evidences,
+                promptRewriteEvidences = snapshot.promptRewriteEvidences,
                 modelExposure = snapshot.modelExposure,
                 failover = snapshot.failover,
                 overlayKeepAlive = snapshot.overlayKeepAlive,
@@ -601,6 +657,16 @@ class AppViewModel(
             }
             _state.value = _state.value.copy(storage = report, storedCalls = count)
         }
+    }
+
+    /**
+     * 清理缓存类占用（更新包、崩溃日志、完整原文溢出），保留调用记录与用量。
+     *
+     * 这是「空间吃紧但不想丢历史」时的默认动作：删掉的只是能从记录重新生成或无关紧要的副本。
+     */
+    fun clearCaches() = action(alsoRefreshStorage = true) {
+        val (bytes, files) = engine.clearCaches()
+        if (files == 0L) "没有可清理的缓存" else "已清理 ${StorageAudit.formatSize(bytes)}（$files 个文件）"
     }
 
     fun refreshModels(silent: Boolean = false, forceRefresh: Boolean = false) {
@@ -834,7 +900,7 @@ class AppViewModel(
 
     // ------------------------------------------------------------ 客户端密钥
 
-    /** 新建密钥；[onCreated] 在创建后回调（用于把完整密钥展示一次给用户复制）。 */
+    /** 新建密钥；[onCreated] 在创建后回调（用于立刻把新密钥展示给用户复制，之后仍可在列表里查看）。 */
     fun addClientKey(
         name: String,
         secret: String?,
@@ -872,7 +938,7 @@ class AppViewModel(
         }
     }
 
-    /** 轮换密钥：[onRotated] 拿到新密钥后必须立刻展示给用户，之后只能看到末四位。 */
+    /** 轮换密钥：[onRotated] 拿到新密钥后立刻展示给用户；旧密钥立即失效，新密钥之后仍可在列表里查看。 */
     fun rotateClientKey(id: String, onRotated: (String) -> Unit) {
         viewModelScope.launch {
             val secret = withContext(Dispatchers.IO) { engine.clientKeyStore.rotate(id) }
@@ -994,6 +1060,88 @@ class AppViewModel(
         _state.value = _state.value.copy(evidences = emptyList())
     }
 
+    /** 清空风控提示词替换的命中记录。 */
+    fun clearPromptRewriteEvidences() {
+        engine.promptRewriter.clearEvidence()
+        _state.value = _state.value.copy(promptRewriteEvidences = emptyList())
+    }
+
+    /** 开关某个内置替换预设。 */
+    fun togglePromptRewritePreset(setName: String) {
+        val current = engine.securitySettings().effectivePromptPresets()
+        val next = if (setName in current) current - setName else current + setName
+        // 存全量列表：空列表会被当成「未配置」而回落到全部开启，所以必须先落成显式集合。
+        updateSecuritySettings(engine.securitySettings().copy(promptRewritePresets = next.toList()))
+    }
+
+    /** 新增一条自定义替换规则。 */
+    fun addPromptRewriteRule(name: String, pattern: String, replacement: String) {
+        val trimmed = pattern.trim()
+        if (trimmed.isEmpty()) {
+            notice("匹配文本不能为空")
+            return
+        }
+        val settings = engine.securitySettings()
+        val rule = dev.aigw.core.security.PromptRule(
+            name = name.trim().ifEmpty { "自定义/${trimmed.take(24)}" },
+            pattern = trimmed,
+            replacement = replacement,
+        )
+        updateSecuritySettings(settings.copy(promptRewriteRules = settings.promptRewriteRules + rule))
+    }
+
+    /** 删除一条自定义替换规则。 */
+    fun removePromptRewriteRule(rule: dev.aigw.core.security.PromptRule) {
+        val settings = engine.securitySettings()
+        updateSecuritySettings(settings.copy(promptRewriteRules = settings.promptRewriteRules - rule))
+    }
+
+    /** 禁用一条内置替换规则（内置规则写死在代码里，用禁用列表实现「删除」）。 */
+    fun disableBuiltinPromptRule(ruleName: String) {
+        val settings = engine.securitySettings()
+        if (settings.isBuiltinRuleDisabled(ruleName)) return
+        updateSecuritySettings(
+            settings.copy(promptRewriteDisabledRules = settings.promptRewriteDisabledRules + ruleName),
+        )
+    }
+
+    /** 恢复一条被禁用的内置规则。 */
+    fun enableBuiltinPromptRule(ruleName: String) {
+        val settings = engine.securitySettings()
+        updateSecuritySettings(
+            settings.copy(promptRewriteDisabledRules = settings.promptRewriteDisabledRules - ruleName),
+        )
+    }
+
+    /** 恢复全部被禁用的内置规则。 */
+    fun enableAllBuiltinPromptRules() {
+        val settings = engine.securitySettings()
+        if (settings.promptRewriteDisabledRules.isEmpty()) return
+        updateSecuritySettings(settings.copy(promptRewriteDisabledRules = emptyList()))
+    }
+
+    /** 导出全部自定义规则（JSON 文本），供用户存成文件或分享。 */
+    fun exportPromptRewriteRules(): String =
+        dev.aigw.core.security.PromptRiskRewriter.encodeRules(engine.securitySettings().promptRewriteRules)
+
+    /**
+     * 导入规则。同名（name）的覆盖，其余追加，所以重复导入同一份文件不会堆出重复规则。
+     *
+     * @return 导入的条数；解析失败返回 -1。
+     */
+    fun importPromptRewriteRules(raw: String): Int {
+        val parsed = dev.aigw.core.security.PromptRiskRewriter.decodeRules(raw)
+            ?: return -1
+        if (parsed.isEmpty()) return 0
+        val settings = engine.securitySettings()
+        val existing = settings.promptRewriteRules.associateBy { it.name }
+        val merged = LinkedHashMap<String, dev.aigw.core.security.PromptRule>()
+        for ((name, rule) in existing) merged[name] = rule
+        for (rule in parsed) merged[rule.name] = rule
+        updateSecuritySettings(settings.copy(promptRewriteRules = merged.values.toList()))
+        return parsed.size
+    }
+
     fun setDynamicColor(enabled: Boolean) {
         _state.value = _state.value.copy(dynamicColor = enabled)
         viewModelScope.launch { withContext(Dispatchers.IO) { appearance.setDynamicColor(enabled) } }
@@ -1048,7 +1196,7 @@ class AppViewModel(
         }
     }
 
-    /** 恢复默认外观（明暗模式、页面底色、金色渐变）。 */
+    /** 恢复默认外观（明暗模式、页面底色、金色渐变、悬浮底栏）。 */
     fun resetAppearance() {
         persistAppearanceJob?.cancel()
         _state.value = _state.value.copy(
@@ -1056,10 +1204,33 @@ class AppViewModel(
             backgroundOverride = null,
             goldStart = defaultAppColors.goldStart,
             goldEnd = defaultAppColors.goldEnd,
+            floatingNavBar = false,
         )
         viewModelScope.launch {
             withContext(Dispatchers.IO) { appearance.reset() }
             _state.value = _state.value.copy(notice = "外观主题已恢复默认")
+        }
+    }
+
+    /** 底部导航悬浮开关。 */
+    fun setFloatingNavBar(enabled: Boolean) {
+        _state.value = _state.value.copy(floatingNavBar = enabled)
+        viewModelScope.launch { withContext(Dispatchers.IO) { appearance.setFloatingNavBar(enabled) } }
+    }
+
+    /**
+     * 保存首页布局：顺序与隐藏项一起落盘。
+     *
+     * 编辑模式下每次拖动/删除都调一次（FlClash 也是拖完即落盘），
+     * 这样中途退出或进程被杀都不会丢掉刚才的调整。
+     */
+    fun saveHomeLayout(order: List<HomeWidget>, hidden: Set<HomeWidget>) {
+        _state.value = _state.value.copy(homeOrder = order, homeHidden = hidden)
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) {
+                homeLayout.setOrder(order)
+                homeLayout.setHidden(hidden)
+            }
         }
     }
 
@@ -1224,13 +1395,7 @@ class AppViewModel(
             }
             _state.value = _state.value.copy(busy = "")
             result.fold(
-                onSuccess = { models ->
-                    if (models.isEmpty()) {
-                        onResult(emptyList(), "没有拉到模型，检查接口地址与 API Key")
-                    } else {
-                        onResult(models, "")
-                    }
-                },
+                onSuccess = { fetched -> onResult(fetched.models, fetched.error) },
                 onFailure = { onResult(emptyList(), it.message ?: "拉取失败") },
             )
         }
@@ -1462,6 +1627,28 @@ class AppViewModel(
         engine.performActionAll(targets, ACTION_CHECKIN, onProgress = onProgress)
     }
 
+    /** 今日自动签到是否已成功跑完（界面状态展示用）。 */
+    fun autoCheckinDoneToday(): Boolean = engine.autoCheckin.doneToday()
+
+    /**
+     * 试跑一次自动签到（手动验证整条链路，不改变「今天已跑过」的判定依据之外的行为）。
+     *
+     * [force] 绕过日期闸门与失败退避，但**不**绕过并发重入；上游对已签到账号回
+     * 「今日已签到」（ok=true），不会重复领取，因此今天就能安全地验证
+     * 「选目标 → 批量执行 → 逐条回执 → 日志」是否真的接通。
+     *
+     * 结果除顶部提示外还写进请求日志页：日志是可回读的现场证据，提示一闪就没了。
+     */
+    fun runAutoCheckinSelfTest() {
+        viewModelScope.launch {
+            val report = withContext(Dispatchers.IO) { engine.autoCheckin.tick(force = true) }
+            _state.value = _state.value.copy(notice = report.summary())
+            engine.requestLog.info("自动签到试跑：${report.summary()}")
+            report.messages.forEach { engine.requestLog.info("自动签到试跑 · $it") }
+            refresh()
+        }
+    }
+
     /**
      * 对所有支持任务的账号批量执行任务（Loomy 的新手任务、WorkBuddy 成长中心）。
      *
@@ -1493,11 +1680,7 @@ class AppViewModel(
      * 于是这类账号压根不进入流程，而不是跑完再逐条报错。
      */
     private fun batchTargets(action: String, capability: ProviderCapability): List<BatchTarget> =
-        engine.providers()
-            .filter { capability in it.capabilities }
-            .flatMap { info -> engine.accounts(info.id) }
-            .filter { account -> engine.supportsAction(account.providerId, account.uid, action) }
-            .map { BatchTarget(it.providerId, it.uid) }
+        engine.batchTargetsFor(action, capability)
 
     /**
      * 批量动作的可执行目标概览：有哪些供应商、各几个账号会被实际执行。
@@ -1636,13 +1819,40 @@ class AppViewModel(
 
     // ------------------------------------------------------------------ 自定义供应商
 
+    /**
+     * 新建或编辑自定义供应商：配置、首个账号的多个 Key、模型列表一次写完。
+     *
+     * 以前分两步（先存基本信息，再进详情页添加账号），用户按直觉填完保存得到的是一个
+     * 0 账号、不可用的供应商。校验失败直接抛异常，`action` 会把原文弹出来。
+     */
     fun saveCustomProvider(config: CustomProviderConfig) = action {
-        val list = engine.settingsRepository.loadCustomProviders().toMutableList()
-        val index = list.indexOfFirst { it.key == config.key }
-        if (index >= 0) list[index] = config else list.add(config)
-        engine.settingsRepository.saveCustomProviders(list)
+        val key = CustomProviderConfig.normalizeKey(config.key)
+        if (key.isEmpty()) throw IllegalStateException("短名不能为空")
+        val baseUrl = CustomProvider.normalizeBaseUrl(config.baseUrl)
+        if (baseUrl.isEmpty()) throw IllegalStateException("请填写接口地址")
+        val keys = config.apiKeys.map { it.trim() }.filter { it.isNotEmpty() }.distinct()
+
+        val repository = engine.settingsRepository
+        val list = repository.loadCustomProviders()
+        if (list.any { it.key == key && it.providerId != config.providerId }) {
+            throw IllegalStateException("短名「$key」已经被另一个供应商使用")
+        }
+        // 改短名会把 providerId 一起改掉，旧 id 下的账号就成孤儿：先拦下来
+        val renaming = config.providerId != "custom:$key"
+        if (renaming && engine.accounts(config.providerId).isNotEmpty()) {
+            throw IllegalStateException("已有账号的供应商不能改短名，先删掉账号或重建供应商")
+        }
+
+        val saved = config.copy(key = key, baseUrl = baseUrl, apiKeys = keys)
+        val updated = list.toMutableList()
+        val index = updated.indexOfFirst { it.key == key }
+        if (index >= 0) updated[index] = saved else updated.add(saved)
+        repository.saveCustomProviders(updated)
         engine.reloadCustomProviders()
-        engine.syncCustomAccounts(config)
+        engine.syncCustomAccounts(saved)
+
+        // 账号可能变了（新增 Key / 删除 Key），模型目录跟着重拉一遍
+        if (keys.isNotEmpty()) refreshModels(silent = true)
         "供应商已保存"
     }
 
@@ -1663,6 +1873,59 @@ class AppViewModel(
     fun updateProxySettings(settings: ProxySettings) {
         _state.value = _state.value.copy(proxy = settings)
         viewModelScope.launch { withContext(Dispatchers.IO) { engine.updateProxySettings(settings) } }
+    }
+
+    /** 新增或更新一套代理配置（保存后立即成为当前使用的配置）。 */
+    fun saveProxyProfile(profile: ProxyProfile) {
+        updateProxySettings(_state.value.proxy.upsertProfile(profile))
+    }
+
+    fun removeProxyProfile(id: String) {
+        updateProxySettings(_state.value.proxy.removeProfile(id))
+        val results = _state.value.proxyProbeResults - id
+        _state.value = _state.value.copy(proxyProbeResults = results)
+    }
+
+    fun activateProxyProfile(id: String) {
+        updateProxySettings(_state.value.proxy.copy(activeProfileId = id))
+    }
+
+    /** 勾选/取消某个路由（供应商或供应商×区域）走代理。 */
+    fun toggleProxyRoute(routeKey: String, proxied: Boolean) {
+        val current = _state.value.proxy
+        // 白名单里的 `*` 要先展开成具体路由：否则取消单项后 `*` 仍把它命中，开关看起来没反应
+        val base = if (ProxySettings.ALL_ROUTES in current.proxiedRoutes) {
+            _state.value.proxyTargets.map { it.routeKey }.toSet()
+        } else {
+            current.proxiedRoutes
+        }
+        val routes = if (proxied) base + routeKey else base - routeKey
+        updateProxySettings(current.copy(proxiedRoutes = routes))
+    }
+
+    fun toggleAllProxyRoutes(proxied: Boolean) {
+        val current = _state.value.proxy
+        if (!proxied) {
+            updateProxySettings(current.copy(proxiedRoutes = emptySet()))
+            return
+        }
+        // 全选落到具体路由键，而不是 `*`：之后新增的供应商不应被默默纳入代理
+        val all = current.proxiedRoutes.filterNot { it == ProxySettings.ALL_ROUTES }.toSet() +
+            _state.value.proxyTargets.map { it.routeKey }
+        updateProxySettings(current.copy(proxiedRoutes = all))
+    }
+
+    /** 测试一套代理配置的连通性；结果保留在状态里供页面展示。 */
+    fun testProxyProfile(id: String) {
+        _state.value = _state.value.copy(
+            proxyProbeResults = _state.value.proxyProbeResults + (id to ProxyProbeState.Testing),
+        )
+        viewModelScope.launch {
+            val result = withContext(Dispatchers.IO) { engine.probeProxyProfile(id) }
+            _state.value = _state.value.copy(
+                proxyProbeResults = _state.value.proxyProbeResults + (id to ProxyProbeState.Done(result)),
+            )
+        }
     }
 
     // ------------------------------------------------------------------ 额度包
@@ -1778,8 +2041,15 @@ class AppViewModel(
         }
         cancelRequested = false
         _state.value = _state.value.copy(updateDownload = UpdateDownload.Probing)
-        val target = File(File(app.cacheDir, "updates").apply { mkdirs() }, "update-${info.version}.apk")
+        val target = File(app.updateApkDir().apply { mkdirs() }, "update-${info.version}.apk")
         updateJob = viewModelScope.launch {
+            // 下载前先清掉旧包：每次升级都留一份 APK，几轮下来就是几十 MB。
+            // 放在 IO 线程做，避免目录很大时卡主线程。
+            withContext(Dispatchers.IO) {
+                app.updateApkDir().listFiles()?.forEach { old ->
+                    if (old.isFile && old.absolutePath != target.absolutePath) old.delete()
+                }
+            }
             // 线路按实测带宽降序；全部探测失败时退回内置顺序逐一尝试
             val candidates = withContext(Dispatchers.IO) {
                 MirrorSpeedTest().measure(apkUrl, UpdateSources.DOWNLOAD)

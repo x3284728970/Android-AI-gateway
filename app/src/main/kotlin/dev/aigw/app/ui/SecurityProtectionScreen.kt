@@ -1,5 +1,6 @@
 package dev.aigw.app.ui
 
+import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -29,14 +30,17 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import dev.aigw.core.security.OutboundEvidence
+import dev.aigw.core.security.PromptRule
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -52,6 +56,7 @@ fun SecurityProtectionScreen(
     onBack: () -> Unit,
 ) {
     var showEvidenceSheet by remember { mutableStateOf(false) }
+    var showPromptRewriteSheet by remember { mutableStateOf(false) }
     var showRateLimitDialog by remember { mutableStateOf(false) }
 
     PageScaffold(
@@ -59,6 +64,14 @@ fun SecurityProtectionScreen(
         subtitle = "反审核脱敏与账号限速",
         leading = { BackButton(onBack) },
     ) {
+        // 组件 0：本地隐私脱敏
+        PrivacyRedactionComponent(
+            state = state,
+            onToggle = { enabled ->
+                viewModel.updateSecuritySettings(state.security.copy(privacyRedactionEnabled = enabled))
+            },
+        )
+
         // 组件 1：反审核脱敏模块
         DesensitizationComponent(
             state = state,
@@ -69,7 +82,26 @@ fun SecurityProtectionScreen(
             onViewEvidence = { showEvidenceSheet = true },
         )
 
-        // 组件 2：账号级限速模块
+        // 组件 2：风控提示词替换
+        PromptRewriteComponent(
+            state = state,
+            onToggle = { enabled ->
+                viewModel.updateSecuritySettings(state.security.copy(promptRewriteEnabled = enabled))
+            },
+            onTogglePreset = { setName -> viewModel.togglePromptRewritePreset(setName) },
+            onDisableBuiltinRule = { viewModel.disableBuiltinPromptRule(it) },
+            onEnableBuiltinRule = { viewModel.enableBuiltinPromptRule(it) },
+            onEnableAllBuiltinRules = { viewModel.enableAllBuiltinPromptRules() },
+            onExportRules = { viewModel.exportPromptRewriteRules() },
+            onImportRules = { viewModel.importPromptRewriteRules(it) },
+            onAddRule = { name, pattern, replacement ->
+                viewModel.addPromptRewriteRule(name, pattern, replacement)
+            },
+            onRemoveRule = { rule -> viewModel.removePromptRewriteRule(rule) },
+            onViewEvidence = { showPromptRewriteSheet = true },
+        )
+
+        // 组件 3：账号级限速模块
         RateLimitComponent(
             state = state,
             onOpenEdit = { showRateLimitDialog = true },
@@ -81,6 +113,14 @@ fun SecurityProtectionScreen(
             evidences = state.evidences,
             onDismiss = { showEvidenceSheet = false },
             onClear = { viewModel.clearEvidences() },
+        )
+    }
+
+    if (showPromptRewriteSheet) {
+        PromptRewriteEvidenceSheet(
+            evidences = state.promptRewriteEvidences,
+            onDismiss = { showPromptRewriteSheet = false },
+            onClear = { viewModel.clearPromptRewriteEvidences() },
         )
     }
 
@@ -99,6 +139,39 @@ fun SecurityProtectionScreen(
                 showRateLimitDialog = false
             },
         )
+    }
+}
+
+// ==============================================================================
+// 独立防护组件 0：本地隐私脱敏
+// ==============================================================================
+
+@Composable
+fun PrivacyRedactionComponent(
+    state: AppUiState,
+    onToggle: (Boolean) -> Unit,
+) {
+    SectionLabel("本地隐私脱敏")
+    SectionCard(enterIndex = 0) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text("出网前脱敏", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    text = "请求发给上游前，把 API Key、邮箱等换成占位符，等回答回来再还原。上游与模型看到的不是你的真实密钥，本机客户端无感",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Switch(
+                checked = state.security.privacyRedactionEnabled,
+                onCheckedChange = onToggle,
+            )
+        }
     }
 }
 
@@ -147,7 +220,462 @@ fun DesensitizationComponent(
 }
 
 // ==============================================================================
-// 独立防护组件 2：账号级限速
+// 独立防护组件 2：风控提示词替换
+// ==============================================================================
+
+@Composable
+fun PromptRewriteComponent(
+    state: AppUiState,
+    onToggle: (Boolean) -> Unit,
+    onTogglePreset: (String) -> Unit,
+    onDisableBuiltinRule: (String) -> Unit,
+    onEnableBuiltinRule: (String) -> Unit,
+    onEnableAllBuiltinRules: () -> Unit,
+    onExportRules: () -> String,
+    onImportRules: (String) -> Int,
+    onAddRule: (name: String, pattern: String, replacement: String) -> Unit,
+    onRemoveRule: (dev.aigw.core.security.PromptRule) -> Unit,
+    onViewEvidence: () -> Unit,
+) {
+    val context = LocalContext.current
+    val clipboard = LocalClipboardManager.current
+    var showAddDialog by remember { mutableStateOf(false) }
+    var showImportDialog by remember { mutableStateOf(false) }
+    var openSetName by remember { mutableStateOf<String?>(null) }
+    val activePresets = state.security.effectivePromptPresets()
+    val presetSets = remember { dev.aigw.core.security.PromptRiskRewriter.builtinRuleSets() }
+
+    SectionLabel("风控提示词替换")
+    SectionCard(enterIndex = 1) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text("开启替换", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    text = "反重力会检查系统提示词来判定你是不是反代，命中后不一定报错，常伪装成 429 或直接降智。" +
+                        "开启后把那些固定句式改写成等义说法，模型理解不变。只改 system，不动你的输入",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Switch(
+                checked = state.security.promptRewriteEnabled,
+                onCheckedChange = onToggle,
+            )
+        }
+
+        if (state.security.promptRewriteEnabled) {
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+            Text(
+                text = "内置规则集",
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.SemiBold,
+            )
+            presetSets.forEach { (setName, rules) ->
+                val disabledCount = rules.count { state.security.isBuiltinRuleDisabled(it.name) }
+                val countText = if (disabledCount > 0) {
+                    "${rules.size} 条规则 · 已禁用 ${disabledCount} 条"
+                } else {
+                    "${rules.size} 条规则"
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                ) {
+                    // 可点击区域只包文字：若整行可点，点 Switch 会同时弹出抽屉。
+                    Column(
+                        Modifier
+                            .weight(1f)
+                            .clickable { openSetName = setName },
+                    ) {
+                        Text(setName, style = MaterialTheme.typography.bodyMedium)
+                        Text(
+                            text = countText,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    Switch(
+                        checked = setName in activePresets,
+                        onCheckedChange = { onTogglePreset(setName) },
+                    )
+                }
+            }
+            if (state.security.promptRewriteDisabledRules.isNotEmpty()) {
+                OutlineActionButton("恢复全部禁用规则") {
+                    onEnableAllBuiltinRules()
+                }
+            }
+
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+            Text(
+                text = "自定义规则（${state.security.promptRewriteRules.size} 条）",
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.SemiBold,
+            )
+            if (state.security.promptRewriteRules.isEmpty()) {
+                Text(
+                    text = "上游新增检测时，在这里录入命中的句子和替换文本",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            } else {
+                state.security.promptRewriteRules.forEach { rule ->
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text(rule.name, style = MaterialTheme.typography.bodyMedium)
+                            Text(
+                                text = rule.pattern,
+                                style = MaterialTheme.typography.bodySmall,
+                                fontFamily = FontFamily.Monospace,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        TextButton(onClick = { onRemoveRule(rule) }) { Text("删除") }
+                    }
+                }
+            }
+
+            OutlineActionButton("新增自定义规则") {
+                showAddDialog = true
+            }
+            OutlineActionButton("查看替换取证") {
+                onViewEvidence()
+            }
+            OutlineActionButton("导出规则") {
+                val json = onExportRules()
+                clipboard.setText(AnnotatedString(json))
+                Toast.makeText(context, "规则已复制到剪贴板", Toast.LENGTH_SHORT).show()
+            }
+            OutlineActionButton("导入规则") {
+                showImportDialog = true
+            }
+        }
+    }
+
+    if (showAddDialog) {
+        PromptRewriteRuleDialog(
+            onDismiss = { showAddDialog = false },
+            onConfirm = { name, pattern, replacement ->
+                onAddRule(name, pattern, replacement)
+                showAddDialog = false
+            },
+        )
+    }
+
+    if (showImportDialog) {
+        PromptRewriteImportDialog(
+            onDismiss = { showImportDialog = false },
+            onConfirm = { rawJson ->
+                val n = onImportRules(rawJson)
+                when {
+                    n > 0 -> Toast.makeText(context, "已导入 $n 条规则", Toast.LENGTH_SHORT).show()
+                    n == 0 -> Toast.makeText(context, "文件中没有可用规则", Toast.LENGTH_SHORT).show()
+                    else -> Toast.makeText(context, "解析失败，请检查 JSON 格式", Toast.LENGTH_SHORT).show()
+                }
+                showImportDialog = false
+            },
+        )
+    }
+
+    openSetName?.let { setName ->
+        val rules = presetSets[setName].orEmpty()
+        PromptRuleListSheet(
+            setName = setName,
+            rules = rules,
+            disabledNames = state.security.promptRewriteDisabledRules.toSet(),
+            onDismiss = { openSetName = null },
+            onDisable = onDisableBuiltinRule,
+            onEnable = onEnableBuiltinRule,
+        )
+    }
+}
+
+@Composable
+private fun PromptRewriteRuleDialog(
+    onDismiss: () -> Unit,
+    onConfirm: (name: String, pattern: String, replacement: String) -> Unit,
+) {
+    var name by remember { mutableStateOf("") }
+    var pattern by remember { mutableStateOf("") }
+    var replacement by remember { mutableStateOf("") }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("新增替换规则") },
+        text = {
+            DialogContentColumn {
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = { name = it },
+                    label = { Text("名称（可留空）") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                OutlinedTextField(
+                    value = pattern,
+                    onValueChange = { pattern = it },
+                    label = { Text("要匹配的文本") },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                OutlinedTextField(
+                    value = replacement,
+                    onValueChange = { replacement = it },
+                    label = { Text("替换为") },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Text(
+                    text = "匹配不分大小写，按整句替换。只作用于 system 消息，不影响你的输入。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { onConfirm(name, pattern, replacement) }) { Text("保存") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("取消") }
+        },
+    )
+}
+
+@Composable
+private fun PromptRewriteImportDialog(
+    onDismiss: () -> Unit,
+    onConfirm: (rawJson: String) -> Unit,
+) {
+    var rawText by remember { mutableStateOf("") }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("导入替换规则") },
+        text = {
+            DialogContentColumn {
+                OutlinedTextField(
+                    value = rawText,
+                    onValueChange = { rawText = it },
+                    label = { Text("规则 JSON") },
+                    placeholder = { Text("粘贴规则 JSON 文本") },
+                    minLines = 4,
+                    maxLines = 8,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Text(
+                    text = "支持 {version, rules:[...]} 或裸数组 [...]",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = { onConfirm(rawText) },
+                enabled = rawText.isNotBlank(),
+            ) {
+                Text("导入")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("取消") }
+        },
+    )
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun PromptRuleListSheet(
+    setName: String,
+    rules: List<PromptRule>,
+    disabledNames: Set<String>,
+    onDismiss: () -> Unit,
+    onDisable: (String) -> Unit,
+    onEnable: (String) -> Unit,
+) {
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 20.dp)
+                .padding(bottom = 32.dp),
+        ) {
+            Column {
+                Text(setName, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                Text(
+                    text = "${rules.size} 条规则",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+
+            Spacer(Modifier.height(12.dp))
+
+            if (rules.isEmpty()) {
+                EmptyHint("暂无规则", "该预设规则集中没有可用规则。")
+            } else {
+                LazyColumn(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    itemsIndexed(
+                        rules,
+                        key = { _, item -> item.name },
+                    ) { _, rule ->
+                        val isDisabled = rule.name in disabledNames
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(MaterialTheme.shapes.medium)
+                                .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
+                                .padding(12.dp)
+                                .alpha(if (isDisabled) 0.45f else 1f),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                        ) {
+                            Column(
+                                modifier = Modifier.weight(1f),
+                                verticalArrangement = Arrangement.spacedBy(4.dp),
+                            ) {
+                                Text(
+                                    text = rule.name.removePrefix("$setName/"),
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    fontWeight = FontWeight.Medium,
+                                )
+                                Text(
+                                    text = rule.pattern,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    fontFamily = FontFamily.Monospace,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                                Text(
+                                    text = "→ " + rule.replacement,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    fontFamily = FontFamily.Monospace,
+                                    color = MaterialTheme.colorScheme.primary,
+                                )
+                            }
+                            TextButton(
+                                onClick = {
+                                    if (isDisabled) {
+                                        onEnable(rule.name)
+                                    } else {
+                                        onDisable(rule.name)
+                                    }
+                                },
+                            ) {
+                                Text(if (isDisabled) "恢复" else "删除")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun PromptRewriteEvidenceSheet(
+    evidences: List<dev.aigw.core.security.PromptRewriteEvidence>,
+    onDismiss: () -> Unit,
+    onClear: () -> Unit,
+) {
+    val timeFormat = remember { SimpleDateFormat("HH:mm:ss", Locale.getDefault()) }
+
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 20.dp)
+                .padding(bottom = 32.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Column {
+                    Text("替换取证", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                    Text(
+                        text = "共 ${evidences.size} 条命中记录（只展示 system 改写）",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                if (evidences.isNotEmpty()) {
+                    TextButton(onClick = onClear) { Text("清空") }
+                }
+            }
+
+            Spacer(Modifier.height(12.dp))
+
+            if (evidences.isEmpty()) {
+                EmptyHint("暂无替换记录", "当系统提示词命中替换规则时，改写前后的对照会记录在这里。")
+            } else {
+                LazyColumn(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(14.dp),
+                ) {
+                    itemsIndexed(evidences, key = { _, item -> item.seq }) { _, item ->
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(MaterialTheme.shapes.medium)
+                                .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
+                                .padding(12.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp),
+                        ) {
+                            Text(
+                                text = "${timeFormat.format(Date(item.atMillis))} · ${item.providerId} · ${item.model}",
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                            Text(
+                                text = "命中规则：${item.matchedRules.joinToString(", ")}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.error,
+                                fontWeight = FontWeight.Medium,
+                            )
+                            Text(
+                                text = "改写前：",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            Text(
+                                text = item.originalSnippet,
+                                style = MaterialTheme.typography.bodySmall,
+                                fontFamily = FontFamily.Monospace,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            Text(
+                                text = "改写后：",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.primary,
+                            )
+                            Text(
+                                text = item.rewrittenSnippet,
+                                style = MaterialTheme.typography.bodySmall,
+                                fontFamily = FontFamily.Monospace,
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ==============================================================================
+// 独立防护组件 3：账号级限速
 // ==============================================================================
 
 @Composable
@@ -326,7 +854,7 @@ private fun RateLimitEditDialog(
         onDismissRequest = onDismiss,
         title = { Text("修改账号限速参数") },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            DialogContentColumn {
                 OutlinedTextField(
                     value = minText,
                     onValueChange = { minText = it.filter(Char::isDigit).take(5) },

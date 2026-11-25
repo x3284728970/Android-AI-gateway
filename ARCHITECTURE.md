@@ -52,7 +52,7 @@
 └───────────────┬─────────────────────────────────┘
                 ▼
         [ 上游 API ]
-   Google（走代理）/ 腾讯、字节、讯飞、商汤（国内直连）
+   Google / 腾讯、字节、讯飞、商汤 / 其它（走不走代理全部由「代理设置」页勾选决定）
 ```
 
 **核心不变量（所有代码都必须遵守）**：
@@ -81,7 +81,8 @@
 | `gateway/RoutingGroups.kt` | 路由组与规则：`RoutingGroup`（成员 + 策略 ORDER/WEIGHT + 规则）、`GroupRule`（token 阈值/图片/压缩/工作目录/时段/星期，条件为「与」）、`RoutingGroupResolver`（`orderMembers`/`matches`/请求体解析） | 组对客户端就是一个模型 `group/<id>`；规则只在**一轮开始时**判定，工具回调中途不换模型（否则上游缓存整段作废）；停用的组不应用规则 |
 | `gateway/GatewayMiddleware.kt` | 请求改写链：`ModelAliasMiddleware`（别名）、`SystemPromptAppendMiddleware`、`ThinkTagsStripMiddleware`、`MiddlewareChain` | **钩子抛异常就跳过它继续下一个**，改写永远不能让请求失败；空链走零开销路径 |
 | `usage/ModelPricing.kt` | 模型价格表（四单价齐全才有效）与 `costOf` | **算不出价格返回 null，绝不当 0**；缓存读/写是 prompt 的子集，不重复计费 |
-| `gateway/ProxySettings.kt` | 代理开关 + `DOMESTIC_SUFFIXES` 国内域名强制直连白名单 | 白名单优先级 > 一切代理设置 |
+| `gateway/ProxySettings.kt` | 多套代理配置（`ProxyProfile`）+ 按「供应商 / 区域」白名单（`proxiedRoutes`，键 `providerId` 或 `providerId/region`，`*` 表示全部）+ 地址排除规则 | **是否走代理只由用户勾选决定，没有硬编码的强制直连域名**；本机回环与地址排除规则先于白名单判定 |
+| `gateway/ProxyProbe.kt` | 代理连通性探测：HTTP 走 CONNECT 隧道、SOCKS5 走握手 + CONNECT，结果分 OK / TIMEOUT / UNREACHABLE | 只测「端口能连」不算通：授权错、上游不可达也算不可用 |
 | `gateway/ProviderBootstrap.kt` | 内置 Provider 登记处 | 新增供应商在此加一行 |
 | `gateway/LoopbackCallbackServer.kt` | OAuth 登录回调监听（端口/路径由各 provider 声明：Trae 51120 / Antigravity 51121 / ChatGPT 1455） | 临时端口，用完即释放；redirect_uri 是上游注册值，provider 不得随意改 |
 | `gateway/OpenAiApi.kt` | OpenAI 报文拼装（error/modelList） | |
@@ -113,9 +114,11 @@
 | `provider/loomy/` | 讯飞 Loomy（HTTP 200 + 业务码陷阱）| 模型目录 `modalities.input` 的 audio 位要采集，转写靠它路由 |
 | `provider/raccoon/` | 商汤小浣熊（`xiaohuanxiong.com`，web 通道，网页回调登录）| OpenAI 结构包在 `data` 里、`delta` 是字符串；字段用标准名（v2 是 LiteLLM 层，`max_new_tokens` 会被 500 拒）；有积分余额接口 |
 | `provider/custom/` | 任意 OpenAI 兼容中转站 | 一个 key = 一个账号 |
-| `store/KeyValueStore.kt` | 存储抽象（App 侧用 EncryptedSharedPreferences 实现） | |
+| `store/KeyValueStore.kt` | 存储抽象（App 侧用 EncryptedSharedPreferences 实现）；`flush()` 默认空实现，供合并提交型存储强刷 | |
+| `store/BatchedKeyValueStore.kt` | 把 `logs/`、`usage/`、`clientkey/` 写入合并后交后台线程提交；凭证/设置/登录态仍同步落盘 | **读己所写**（未提交值先查内存）、**不丢写**（提交成功才按值摘除）、提交失败留待下轮不重试风暴；代价是提交窗口内的数据只存在内存里，靠 `flush()` 兜底 |
+| `store/SplitKeyValueStore.kt` | 按前缀把键路由到不同存储：日志与用量独立成文件，凭证/设置留主文件 | 每个加密文件每次提交都整份重写，日志与凭证同文件会让改一条设置也背上重写几 MB；`migrateLegacy()` 幂等搬运旧数据，标记固定在兜底存储 |
 | `security/` | `SecuritySettings`（脱敏/限速开关）、`RequestSanitizer`（system 提示词零宽字符脱敏 + 出网取证）、`AccountRateLimiter`（账号级最小间隔 + 抖动） | 只改 system 消息，不碰 user 输入 |
-| `usage/` | `CallLogStore`（调用记录，每条一键；超出 8K 摘要的完整原文溢出到缓存目录供详情页回读）、`RequestLog`（环形运行日志，容量可运行期调整）、`StorageAudit`（按前缀统计占用） | 记录有容量淘汰与保留天数清理；溢出文件随删除/清空/过期清理/截断一并回收；**请求与尝试分层计量**（`tries`/`retried` 是一次请求内的尝试数，不是请求数） |
+| `usage/` | `CallLogStore`（调用记录，每条一键；超出 8K 摘要的完整原文溢出到缓存目录供详情页回读；`clearFullText()` 只清原文副本、保留记录）、`RequestLog`（环形运行日志，容量可运行期调整）、`StorageAudit`（按前缀统计占用，**并统计注入的缓存目录**） | 记录有容量淘汰与保留天数清理；溢出文件随删除/清空/过期清理/截断一并回收；**占用大头往往在文件系统而非键值存储**（更新包、溢出原文、崩溃日志），只算键值会让界面数字与系统「应用信息」差一个量级；`clearCaches()` 只清可清理项，凭证与调用记录不受影响；**请求与尝试分层计量**（`tries`/`retried` 是一次请求内的尝试数，不是请求数） |
 | `util/` | `CappedStringBuilder`（边收边截）、`CountFormat`、`JsonAccess`、`TimeWindow` | |
 | `update/` | `UpdateRepository`（Release JSON 解析，多线路竞争取先到）、`MirrorSpeedTest`（Range 探测 512KB 测带宽）、`ApkDownloader`（HEAD 取长度后分段并发下载，单段续传+重试）、`UpdateSources`（直连 + 4 条国内镜像的映射表） | 只登记实测支持 `206` 的镜像；镜像请求绕开用户代理（国内入口），直连尊重代理设置；任一线路失败只是少一个候选 |
 
@@ -123,11 +126,11 @@
 
 | 文件 | 职责 |
 |---|---|
-| `AiGatewayApp.kt` | Application：构造引擎（单例）+ 通知渠道 |
+| `AiGatewayApp.kt` | Application：构造引擎（单例）+ 通知渠道；`openStore()` 组装 `SplitKeyValueStore` + `BatchedKeyValueStore` 并执行一次旧数据迁移 |
 | `service/GatewayService.kt` | 前台服务：`startForeground` 必须在 `onStartCommand` 第一行（系统超时 5s 强杀），START_NOT_STICKY 不自重建（自重建是灰色软件检测特征），WakeLock+WifiLock |
 | `service/GatewayTileService.kt` | 控制中心磁贴开关 |
 | `service/FloatingKeepAlive.kt` | 可选的「悬浮窗保活」：`TYPE_APPLICATION_OVERLAY` 小悬浮标签（可拖动、点按回应用），由前台服务按开关启停 |
-| `data/EncryptedKeyValueStore.kt` | 写操作用 `commit()`（同步）而非 `apply()`——换 token 后必须立刻可读 |
+| `data/EncryptedKeyValueStore.kt` | 写操作用 `commit()`（同步）而非 `apply()`——换 token 后必须立刻可读；`fileName` 参数化以开出主文件（`aigw.store`）与日志文件（`aigw.logs`）两个加密库 |
 | `data/ApkInstaller.kt` | 应用内更新安装：校验安装包版本、「安装未知应用」权限引导、FileProvider 交付系统安装器 |
 | `ui/ModelsScreen.kt` | 模型列表：点击复制、Q弹测速按钮 |
 | `ui/ResilienceScreen.kt` | 并发与容错设置页：并发闸门参数、重试退避、熔断器（每个对话框一个参数组） |
@@ -167,7 +170,7 @@ settings/model_pricing.json        # 模型价格表
 settings/middleware.json           # 请求改写（别名/system 追加/think 标签）
 clientkey/usage|window|cycle/...   # 密钥用量台账与限额窗口
 settings/provider/<id>.json        # 供应商设置（含 region 等 option）
-settings/proxy.json                # 代理设置
+settings/proxy.json                # 代理配置（多套）与分流白名单
 settings/custom.json               # 自定义供应商配置
 call/...                           # 调用日志
 ```
