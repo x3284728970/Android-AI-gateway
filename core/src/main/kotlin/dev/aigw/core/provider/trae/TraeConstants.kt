@@ -65,17 +65,28 @@ enum class TraeRegion(
          * `domain` 是 `apiHost` 或登录回调里的 host。
          * 只认第一个参数会把 apiHost 已是 `api.trae.ai` 的国际版凭证判成国内版。
          */
+        /** 国际版站点 host 的特征片段（新加坡 / 美东两套都算）。 */
+        private val INTL_HOST_MARKERS = listOf(
+            "trae.ai",
+            "growsg",
+            "coresg",
+            "coreva",
+            "trae-api-sg",
+            "ug-normal.us",
+        )
+
+        /** 国际版站点会直接写进 region/domain 字段的短码。 */
+        private val INTL_REGION_KEYS = setOf("us-east", "us")
+
         fun infer(explicit: String?, domain: String?): TraeRegion {
             val values = listOf(explicit, domain).map { it?.trim().orEmpty() }
             if (values.any { it.equals(CN.id, ignoreCase = true) }) return CN
             if (values.any { it.equals(INTL.id, ignoreCase = true) }) return INTL
-            return if (values.any {
-                    val v = it.lowercase()
-                    v.contains("trae.ai") || v.contains("growsg") || v.contains("coresg") ||
-                        v.contains("coreva") || v.contains("trae-api-sg") ||
-                        v.contains("ug-normal.us") || v == "us-east" || v == "us"
-                }
-            ) INTL else CN
+            val looksInternational = values.any { raw ->
+                val v = raw.lowercase()
+                v in INTL_REGION_KEYS || INTL_HOST_MARKERS.any { v.contains(it) }
+            }
+            return if (looksInternational) INTL else CN
         }
     }
 }
