@@ -33,7 +33,7 @@ import dev.aigw.core.usage.StorageAudit
 fun DataManagementScreen(state: AppUiState, viewModel: AppViewModel, onBack: () -> Unit) {
     var showDetail by remember { mutableStateOf(false) }
     val retention = state.settings.logRetentionDays
-    val records = state.storage?.recordsChars ?: 0L
+    val records = state.storage?.recordsBytes ?: 0L
 
     // 存储占用不挂在全局 refresh 里（要扫全量存储 + 遍历缓存目录，代价高），
     // 所以进入本页时才单独算一次；清理动作后也会由 refreshStorage 更新。
@@ -100,7 +100,7 @@ private fun StorageDetail(state: AppUiState, viewModel: AppViewModel) {
                         )
                     }
                     Text(
-                        text = StorageAudit.formatSize(entry.chars),
+                        text = StorageAudit.formatSize(entry.bytes),
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.primary,
                     )

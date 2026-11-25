@@ -202,7 +202,7 @@ fun MeScreen(state: AppUiState, viewModel: AppViewModel, open: (SubPage) -> Unit
                 "02.14",
                 "数据管理 · STORAGE AUDIT",
                 "存储占用、保留期与截断",
-                StorageAudit.formatSize(state.storage?.totalChars ?: 0L),
+                StorageAudit.formatSize(state.storage?.totalBytes ?: 0L),
             ) {
                 viewModel.refreshStorage()
                 open(SubPage.DataManagement)
