@@ -1,0 +1,54 @@
+{
+  "_comment": "网关助手 模型倍率远程表。App 每 12 小时自动拉一次（也支持界面手动刷新）。改动只需提交本文件，不必发版。base=基准倍率，discounted=限时/折扣后倍率，tag=折扣条件，source=数据来源，note=口径说明。0 表示免费。",
+  "version": 1,
+  "updated": "2026-11-26",
+  "providers": {
+    "trae": {
+      "seed-evolving": { "base": 0.8, "discounted": 0.08, "tag": "限时1折", "source": "官方", "note": "docs.trae.cn《内置模型限时折扣》" },
+      "doubao-seed-evolving": { "base": 0.8, "discounted": 0.08, "tag": "限时1折", "source": "官方", "note": "docs.trae.cn《内置模型限时折扣》" },
+      "seed-2.1-pro": { "base": 0.8, "discounted": 0.08, "tag": "限时1折", "source": "官方", "note": "docs.trae.cn《内置模型限时折扣》" },
+      "doubao-seed-2.1-pro": { "base": 0.8, "discounted": 0.08, "tag": "限时1折", "source": "官方", "note": "docs.trae.cn《内置模型限时折扣》" },
+      "seed-2.1-turbo": { "base": 0.4, "discounted": 0.1, "tag": "会员2.5折", "source": "官方", "note": "docs.trae.cn《内置模型限时折扣》" },
+      "doubao-seed-2.1-turbo": { "base": 0.4, "discounted": 0.1, "tag": "会员2.5折", "source": "官方", "note": "docs.trae.cn《内置模型限时折扣》" },
+      "seed-code": { "base": 0.12, "discounted": 0.03, "tag": "会员2.5折", "source": "官方", "note": "docs.trae.cn；官方写作 Seed-2.1-Code，模型清单里三种写法视作同一模型" },
+      "seed-2.1-code": { "base": 0.12, "discounted": 0.03, "tag": "会员2.5折", "source": "官方", "note": "docs.trae.cn《内置模型限时折扣》" },
+      "seed-2.0-code": { "base": 0.12, "discounted": 0.03, "tag": "会员2.5折", "source": "官方", "note": "docs.trae.cn《内置模型限时折扣》" },
+      "doubao-seed-code": { "base": 0.12, "discounted": 0.03, "tag": "会员2.5折", "source": "官方", "note": "docs.trae.cn《内置模型限时折扣》" },
+      "doubao-seed-2.0-code": { "base": 0.12, "discounted": 0.03, "tag": "会员2.5折", "source": "官方", "note": "docs.trae.cn《内置模型限时折扣》" },
+      "glm-5.3": { "base": 0.78, "discounted": 0.39, "tag": "会员5折", "source": "官方", "note": "docs.trae.cn《内置模型限时折扣》" },
+      "glm-5.2": { "base": 0.78, "discounted": 0.39, "tag": "会员5折", "source": "官方", "note": "docs.trae.cn《内置模型限时折扣》" },
+      "glm-5": { "base": 0.7, "source": "实测", "note": "社区实测汇总（forum.trae.cn 173840）" },
+      "glm-5.3-flash": { "base": 0.08, "source": "公告", "note": "官方社区：约为 GLM-5.3 的 1/10、限时折扣内 1/20（forum.trae.cn 178015）" },
+      "deepseek-v4-pro": { "base": 0.72, "discounted": 0.36, "tag": "空闲5折", "source": "官方", "note": "docs.trae.cn；22:00-次日 8:00 享 5 折" },
+      "deepseek-v4-pro-official": { "base": 0.72, "discounted": 0.36, "tag": "空闲5折", "source": "官方", "note": "docs.trae.cn；22:00-次日 8:00 享 5 折" },
+      "deepseek-v4-flash": { "base": 0.16, "discounted": 0.08, "tag": "5折", "source": "官方", "note": "docs.trae.cn；免费用户空闲时段 5 折，会员全时段 5 折" },
+      "deepseek-v4-flash-official": { "base": 0.16, "discounted": 0.08, "tag": "5折", "source": "官方", "note": "docs.trae.cn；免费用户空闲时段 5 折，会员全时段 5 折" },
+      "qwen3.8-max": { "base": 1.5, "source": "公告", "note": "官方社区模型上新公告（forum.trae.cn 175814）" },
+      "qwen3.8-flash": { "base": 0.08, "source": "公告", "note": "官方社区模型上新公告（forum.trae.cn 178262）" },
+      "qwen-3.7-plus": { "base": 0.25, "source": "实测", "note": "社区实测汇总（forum.trae.cn 173840）" },
+      "kimi-k3": { "base": 1.65, "source": "实测", "note": "社区实测汇总（forum.trae.cn 173840）" },
+      "kimi-k2.7-code": { "base": 0.62, "source": "实测", "note": "社区实测汇总（forum.trae.cn 173840）" },
+      "kimi-k2.6": { "base": 0.69, "source": "实测", "note": "社区实测汇总（forum.trae.cn 173840）" },
+      "minimax-m3": { "base": 0.26, "source": "实测", "note": "社区实测汇总（forum.trae.cn 173840）" },
+      "custom_model_gemini": { "base": 0, "source": "官方", "note": "仅内置模型消耗积分，自定义模型不消耗积分" },
+      "custom_model_kimi": { "base": 0, "source": "官方", "note": "仅内置模型消耗积分，自定义模型不消耗积分" },
+      "custom_model_claude": { "base": 0, "source": "官方", "note": "仅内置模型消耗积分，自定义模型不消耗积分" },
+      "custom_model_gpt-5": { "base": 0, "source": "官方", "note": "仅内置模型消耗积分，自定义模型不消耗积分" },
+      "custom_model_deepseek_v4": { "base": 0, "source": "官方", "note": "仅内置模型消耗积分，自定义模型不消耗积分" }
+    },
+    "today": {
+      "deepseek-v4.1-flash": { "base": 1, "source": "上游", "note": "Today 按「同类任务消耗倍数」计价" },
+      "minimax-m31-flash": { "base": 1, "source": "上游", "note": "限时免费已于 2026-10-29 结束，按 1× 计" },
+      "glm-5.3": { "base": 4, "source": "上游", "note": "Today 按「同类任务消耗倍数」计价" }
+    },
+    "catpaw": {
+      "longcat-2.0": { "base": 1, "source": "上游", "note": "妙手无公开倍率表，以模型目录 rateMultiplier 为准；此处为换算基准" },
+      "auto": { "base": 1, "source": "上游", "note": "自动选择：实际倍率取决于被选中的模型" }
+    },
+    "cline": {
+      "cline-free/deepseek-v4.1-flash": { "base": 0, "source": "官方", "note": "Cline 免费档模型，不计费" },
+      "cline-free/mimo-v2.6-flash": { "base": 0, "source": "官方", "note": "Cline 免费档模型，不计费" },
+      "cline-free/muse-spark-1.3-contributor": { "base": 0, "source": "官方", "note": "Cline 免费档模型，不计费" }
+    }
+  }
+}

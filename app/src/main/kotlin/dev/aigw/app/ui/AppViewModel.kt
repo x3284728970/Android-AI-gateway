@@ -297,6 +297,10 @@ data class AppUiState(
     val modelLoadStates: Map<String, ModelLoadState> = emptyMap(),
     /** 模型测速状态，键为 `model.fullId`。 */
     val modelTestLatencies: Map<String, ModelTestStatus> = emptyMap(),
+    /** 倍率表（远程可更新数据）的同步状态。 */
+    val rateStatus: dev.aigw.core.rate.RateSyncStatus = dev.aigw.core.rate.RateSyncStatus(),
+    /** 正在手动更新倍率表。 */
+    val rateSyncing: Boolean = false,
     /** 代理页的候选路由（供应商或供应商×区域），启动与供应商变动后刷新。 */
     val proxyTargets: List<ProxyTarget> = emptyList(),
     /** 代理连通性测试结果，键为配置 id。 */
@@ -418,6 +422,7 @@ private class Snapshot(
     val pricing: dev.aigw.core.usage.PricingTable,
     val middleware: dev.aigw.core.gateway.MiddlewareSettings,
     val middlewareFailures: Map<String, String>,
+    val rateStatus: dev.aigw.core.rate.RateSyncStatus,
 )
 
 class AppViewModel(
@@ -579,6 +584,7 @@ class AppViewModel(
                     pricing = engine.pricingTable(),
                     middleware = engine.middlewareSettings(),
                     middlewareFailures = engine.middleware().failures(),
+                    rateStatus = engine.rateBook.status(),
                 )
             }
             _state.value = _state.value.copy(
@@ -615,6 +621,7 @@ class AppViewModel(
                 pricing = snapshot.pricing,
                 middleware = snapshot.middleware,
                 middlewareFailures = snapshot.middlewareFailures,
+                rateStatus = snapshot.rateStatus,
             )
         }
     }
@@ -667,6 +674,31 @@ class AppViewModel(
     fun clearCaches() = action(alsoRefreshStorage = true) {
         val (bytes, files) = engine.clearCaches()
         if (files == 0L) "没有可清理的缓存" else "已清理 ${StorageAudit.formatSize(bytes)}（$files 个文件）"
+    }
+
+    /**
+     * 手动更新倍率表。
+     *
+     * 与看门狗里的自动同步走同一个 [dev.aigw.core.rate.RateSync]，只是跳过节流；
+     * 拉取失败不清空已有数据，只把错误写进状态，界面据此提示。
+     */
+    fun syncRates() {
+        if (_state.value.rateSyncing) return
+        _state.value = _state.value.copy(rateSyncing = true)
+        viewModelScope.launch {
+            val result = withContext(Dispatchers.IO) { engine.rateSync.maybeSync(force = true) }
+            _state.value = _state.value.copy(
+                rateSyncing = false,
+                rateStatus = engine.rateBook.status(),
+                notice = when {
+                    result.skipped -> "倍率表正在更新，请稍候"
+                    result.ok -> "倍率表已更新：${result.count} 条（${result.source}）"
+                    else -> "倍率表更新失败：${result.error}"
+                },
+            )
+            // 倍率变化要立刻反映到模型列表：静默重拉一次目录（命中缓存，不打上游）
+            refreshModels(silent = true)
+        }
     }
 
     fun refreshModels(silent: Boolean = false, forceRefresh: Boolean = false) {

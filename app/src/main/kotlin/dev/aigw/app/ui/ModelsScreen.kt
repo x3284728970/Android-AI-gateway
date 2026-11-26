@@ -232,6 +232,14 @@ fun ModelsScreen(state: AppUiState, viewModel: AppViewModel) {
                     }
                 }
             } else {
+                // 倍率数据同步条：数字能不能信，取决于它是什么时候拉下来的
+                item(key = "rate-sync") {
+                    RateSyncCard(
+                        status = state.rateStatus,
+                        syncing = state.rateSyncing,
+                        onSync = { viewModel.syncRates() },
+                    )
+                }
                 // 已加载的模型按组展示
                 for ((routePrefix, models) in grouped) {
                     val title = models.firstOrNull()?.providerName ?: routePrefix

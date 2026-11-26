@@ -34,7 +34,8 @@ Android 上运行的本地 AI 模型聚合网关：把多家私有 AI 服务账�
 
 - **OpenAI 兼容网关**：`/v1/chat/completions` + `/v1/models`，流式 SSE / 非流式 / 多模态识图；另提供 `/v1/images/generations`（图片生成）与 `/v1/audio/transcriptions`（语音转文字）。
 - **Anthropic 兼容入口**：`/v1/messages` 与 `/v1/messages/count_tokens`（本分支新增），请求在网关入口翻译成 OpenAI 形状后复用同一批 Provider，响应再翻回去——新增供应商不需要写两遍。
-- **十一家内置供应商**：Trae、WorkBuddy / CodeBuddy、Antigravity、ChatGPT、Loomy、小浣熊（商汤）、**LongCat（美团）**、**Today**、**Qoder**、**千问办公**、**百度搭子**，以及任意自定义 OpenAI 兼容中转站。
+- **内置供应商**：Trae、WorkBuddy / CodeBuddy、Antigravity、ChatGPT、Loomy、小浣熊（商汤）、**LongCat（美团）**、**Today**、**GitHub Copilot**、**妙手 CatPaw（美团）**、**Cline**，以及任意自定义 OpenAI 兼容中转站。
+- **倍率数据自动更新**：模型计费倍率（以及限时折扣）放在仓库的 `config/model-rates.json`，App 自启动后每 12 小时自动拉一次，失败退避 30 分钟且不清空旧值；模型页可手动刷新，并显示数据更新时间与来源。
 - **同款模型 Failover**：首选供应商失败或无可用账号时，自动切换到拥有同款模型的其他供应商。
 - **智能路由**：`供应商/模型` 前缀路由（含 `trae-cn/`、`codebuddy-global/` 这类区域前缀与 `google/`、`agy/`、`lc/` 等别名），兼支持无前缀的模型名自动推导。
 
@@ -70,6 +71,8 @@ Android 上运行的本地 AI 模型聚合网关：把多家私有 AI 服务账�
 | **模型能力标记** | 模型列表显示「思考 · 联网 · 识图 · 工具 · 输出 N · vendor」与「倍率 / 限时折扣」——上游 core 一直在算 `extra["rate"]`，但界面不读。 |
 | **能力字段透出** | `/v1/models` 输出 `capabilities` 数组与 `supports_vision` / `input_modalities` 等通用平铺字段，客户端（如 Minis）据此自动勾选「图片输入 / 思考」。能力解析统一在 `util/ModelCapabilities.kt`，各家上游字段写法五花八门，只有**明确为真**才写——「没说」不等于「不支持」。 |
 | **显式路由不跨供应商回退** | 请求带 `供应商/模型` 前缀时，失败只在这一家内换号，绝不悄悄换到别家。不带前缀才允许 Failover。起因是真实事故：用户在 Today 上试限时免费模型，凭证失效后网关自动切到 Trae 烧掉 400 积分，用户全程不知道请求去了哪。 |
+| **倍率数据远程更新**（本分支新增） | 倍率原本是编译进 APK 的常量表，一次调价就得发版。现在分层：供应商接口现场值 > 仓库里的 `config/model-rates.json`（每 12 小时自动拉，多镜像回退）> 编译期兜底值。脏数据（负数/NaN/超大/非数字）整条丢弃，绝不显示编出来的数字。 |
+| **三家新渠道**（本分支新增） | GitHub Copilot、妙手 CatPaw、Cline。前两家删掉的百度搭子/千问办公/Qoder 已确认失效并整体移除（含其专属 Cosy 签名工具）。 |
 | **桌面 UA 登录** | 部分上游按 UA 判定「地区不开放」（Trae 国际版），手机 UA 被拒、桌面 UA 同网能进。内嵌登录支持「桌面模式」，用 Chrome 桌面 UA + 桌面视口打开登录页。 |
 
 **刻意保留的上游行为**：上游 v2.14.6 的账号池锁优化、SSE 终止帧补齐、模型级冷却（`ModelCooldownTracker`）、并发闸门（`ConcurrencyGate`）、应用内更新、容错页、悬浮保活，均原样保留。
@@ -224,6 +227,9 @@ curl http://127.0.0.1:8790/v1/messages \
 | `chatgpt` | ChatGPT（OpenAI） | `chatgpt.com/backend-api/codex` | Codex 订阅额度（5 小时/周窗口）；OAuth 登录回调端口 1455 |
 | `longcat` | LongCat（美团） | `longcat.chat` | 双通道：免登录（IP 级限流）/ Cookie 登录；请求体无 `model` 字段 |
 | `today` | Today | `auth.todayai.cn` / `api.todayai.cn` | **无 SSE 接口**，轮询整段快照后本地差分出流；登录用短信验证码（+86）；模型自动发现 |
+| `github-copilot` | GitHub Copilot | `api.githubcopilot.com` | GitHub 设备码登录 → 换 Copilot 短期 token（约 30 分钟，临期自动重换）；**必须带官方客户端指纹头**，否则 401 |
+| `catpaw` | 妙手 CatPaw（美团） | `ai.catpaw.meituan.com` / `catx.nocode.cn` | `round → event → turn` 三步会话；turn 的 SSE 是**累积全文**，本地做前缀差分；只收扁平文本，工具/图片显式拒绝 |
+| `cline` | Cline | `api.cline.bot/api/v1` | WorkOS 设备流 → `/auth/register` 换账号令牌对（漏了这步必 401）；模型 id 自带 `cline-free/` `cline-pass/` 档位前缀，不能剥 |
 | `custom:<key>` | 自定义 | 用户填写的 baseUrl | 任意 OpenAI 兼容中转站，一个 key = 一个账号 |
 
 ---

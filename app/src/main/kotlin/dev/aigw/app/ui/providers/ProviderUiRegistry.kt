@@ -2,7 +2,9 @@ package dev.aigw.app.ui.providers
 
 import java.util.concurrent.ConcurrentHashMap
 import dev.aigw.app.ui.providers.antigravity.AntigravityUi
+import dev.aigw.app.ui.providers.catpaw.CatPawUi
 import dev.aigw.app.ui.providers.chatgpt.ChatGPTUi
+import dev.aigw.app.ui.providers.cline.ClineUi
 import dev.aigw.app.ui.providers.codebuddy.CodeBuddyUi
 import dev.aigw.app.ui.providers.copilot.CopilotUi
 import dev.aigw.app.ui.providers.custom.CustomUi
@@ -30,6 +32,8 @@ object ProviderUiRegistry {
         ChatGPTUi,
         RaccoonUi,
         CopilotUi,
+        CatPawUi,
+        ClineUi,
     ).associateBy { it.id }
 
     private val customCache = ConcurrentHashMap<String, ProviderUi>()

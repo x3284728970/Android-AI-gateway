@@ -219,6 +219,17 @@ class GatewayEngine(
     val requestLog = RequestLog(store, nowMillis = nowMillis)
     val registry = ProviderRegistry()
 
+    /**
+     * 倍率台账：远程表 + 供应商现场数据的覆盖层。
+     *
+     * 模型目录出网关前统一在这里补/覆盖倍率字段（[withRates]），
+     * 因此新增供应商不需要自己维护倍率表，只要上游接口里有就能自动显示。
+     */
+    val rateBook = dev.aigw.core.rate.RateBook(store, nowMillis)
+
+    /** 倍率表同步器；看门狗按 12 小时节流调用，界面也可手动触发。 */
+    val rateSync = dev.aigw.core.rate.RateSync(rateBook, nowMillis = nowMillis)
+
     val sanitizer = dev.aigw.core.security.RequestSanitizer(nowMillis)
     val rateLimiter = dev.aigw.core.security.AccountRateLimiter(nowMillis)
 
@@ -1859,7 +1870,24 @@ class GatewayEngine(
     /** 用给定账号拉一份模型目录；凭证临期或已过期时先做一次安全的 refreshAccount 保鲜。 */
     private fun fetchCatalog(provider: Provider, picked: ProviderAccount?): ProviderModelCatalogView {
         val account = picked?.let { freshAccount(provider, it) }
-        return provider.listModels(account)
+        return withRates(provider.id, provider.listModels(account))
+    }
+
+    /**
+     * 用倍率台账给模型条目补/覆盖倍率字段。
+     *
+     * 分层优先级：台账里的现场数据 > 远程表 > provider 自己编译进去的兜底值。
+     * 台账没有该模型的记录时原样返回，绝不用「猜」的数字填空。
+     */
+    private fun withRates(providerId: String, view: ProviderModelCatalogView): ProviderModelCatalogView {
+        if (view.models.isEmpty()) return view
+        var changed = false
+        val decorated = view.models.map { model ->
+            val entry = rateBook.rate(providerId, model.id) ?: return@map model
+            changed = true
+            model.copy(extra = model.extra + entry.toExtras())
+        }
+        return if (changed) view.copy(models = decorated) else view
     }
 
     /**

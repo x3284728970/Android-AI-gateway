@@ -96,6 +96,7 @@ class GatewayService : Service() {
                 // shouldRun 是纯内存快路径（读台账 + 比日期），绝大多数轮次在这里就返回，
                 // 连线程都不必起；真要执行时另起线程，绝不占住探活线程去等上游。
                 maybeRunAutoCheckin()
+                maybeSyncRates()
                 probing = false
                 watchdogHandler.post {
                     if (active && !watchdog.gaveUp) scheduleNextTick()
@@ -231,11 +232,29 @@ class GatewayService : Service() {
         }.onFailure { Log.w(TAG, "自动签到闸门异常：${it.message}") }
     }
 
+    /**
+     * 倍率表自动更新：蹭同一个 30 秒节拍，按 12 小时节流。
+     *
+     * 与自动签到同构：闸门是纯内存快路径，绝大多数轮次在这里直接返回；
+     * 真要拉取时另起线程，绝不占住探活线程去等 GitHub。
+     */
+    private fun maybeSyncRates() {
+        runCatching {
+            val engine = applicationContext.gatewayEngine
+            if (!engine.rateBook.shouldRefresh()) return
+            Thread({
+                runCatching { engine.rateSync.maybeSync() }
+                    .onFailure { Log.w(TAG, "倍率表同步异常：${it.message}") }
+            }, "gateway-rate-sync").start()
+        }.onFailure { Log.w(TAG, "倍率表同步闸门异常：${it.message}") }
+    }
+
     private fun startWatchdog() {
         if (active) return
         active = true
         watchdogHandler.removeCallbacks(watchdogTick)
         maybeRunAutoCheckin()
+        maybeSyncRates()
         watchdogHandler.postDelayed(watchdogTick, WATCHDOG_INTERVAL_MS)
     }
 
