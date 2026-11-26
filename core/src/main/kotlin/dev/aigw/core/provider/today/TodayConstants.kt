@@ -42,7 +42,13 @@ object TodayConstants {
     /** 兜底模型表（无账号或上游拉取失败时用）。 */
     val MODEL_IDS = listOf(MODEL_DEEPSEEK, MODEL_MINIMAX, MODEL_GLM)
 
-    /** 倍率表：上游按「同类任务消耗倍数」计价，0 表示限时免费。界面据此标注。 */
+    /**
+     * 倍率表：上游按「同类任务消耗倍数」计价。
+     *
+     * **这是内置参考值，不是上游核过的数据**：`/v1/pricing/status` 只返回模型选项 id
+     * 与套餐用量百分比，没有任何倍率字段（2026-11-26 复核），所以这里不能声称「上游口径」。
+     * 远程倍率表（`config/model-rates.json` 的 `today` 段）会覆盖本表，那边同样标注为「内置」。
+     */
     private val RATES = mapOf(
         MODEL_DEEPSEEK to "1×",
         // 2026-10-29 用户反馈：M3.1 的限时免费已结束，上游按 1× 计

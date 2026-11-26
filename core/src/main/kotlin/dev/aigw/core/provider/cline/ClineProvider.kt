@@ -213,7 +213,7 @@ class ClineProvider(
                         id = modelId,
                         name = name.ifEmpty { prettify(modelId) },
                         extra = buildMap {
-                            if (free) {
+                            if (free || isFreeModel(modelId)) {
                                 put("rate", "免费")
                                 put("rateSummary", "免费模型，不计费")
                                 put("rateOrigin", "live")
@@ -244,12 +244,20 @@ class ClineProvider(
                     ?: item.get("context")?.takeIf { it.isJsonPrimitive }?.asLong
                     ?: 0L
                 val existing = seen[modelId]
+                // 云端目录带 pricing：prompt 价为 0 就是上游自己标的免费，比前缀启发式可靠
+                val zeroPriced = item.objOrNull("pricing")?.get("prompt")
+                    ?.takeIf { it.isJsonPrimitive }?.asString?.toDoubleOrNull() == 0.0
+                val extras = if (zeroPriced && !isFreeModel(modelId)) {
+                    rateExtraOf(modelId) + mapOf("rate" to "免费", "rateSummary" to "免费模型，不计费", "rateOrigin" to "live")
+                } else {
+                    rateExtraOf(modelId)
+                }
                 val merged = (existing ?: ProviderModel(
                     id = modelId,
                     name = item.str("display_name").ifEmpty { item.str("displayName") }
                         .ifEmpty { item.str("name") }
                         .ifEmpty { prettify(modelId) },
-                    extra = rateExtraOf(modelId),
+                    extra = extras,
                 )).copy(contextWindow = if (context > 0) context else (existing?.contextWindow ?: 0L))
                 seen[modelId] = merged
             }
@@ -274,9 +282,17 @@ class ClineProvider(
         return Triple(modelId, name, free)
     }
 
-    /** 免费 / Pass 的标签；没有公开倍率的模型不给数字（不猜）。 */
+    /**
+     * 免费 / Pass 的标签；没有公开倍率的模型不给数字（不猜）。
+     *
+     * 上游有**两套模型命名**，两边都要认：
+     * - 推荐流：`cline-free/nemotron-3.5-super-vl`、`nvidia/nemotron-3.5-lightning-free`
+     * - 云端目录：`nvidia/nemotron-3.5-super-vl:free`（且 `pricing.prompt == "0"`）
+     *
+     * 只按 `cline-free/` 前缀判断会漏掉第二种，把免费模型显示成「无倍率」。
+     */
     private fun rateExtraOf(modelId: String): Map<String, String> = when {
-        modelId.startsWith(ClineConstants.FREE_PREFIX) -> mapOf(
+        isFreeModel(modelId) -> mapOf(
             "rate" to "免费",
             "rateSummary" to "免费模型，不计费",
             "rateOrigin" to "live",
@@ -284,6 +300,12 @@ class ClineProvider(
         modelId.startsWith(ClineConstants.PASS_PREFIX) -> mapOf("rateSummary" to "Cline Pass 订阅内")
         else -> emptyMap()
     }
+
+    /** 免费模型判定：`cline-free/` 前缀、`-free` 结尾、或 `:free` 后缀。 */
+    internal fun isFreeModel(modelId: String): Boolean =
+        modelId.startsWith(ClineConstants.FREE_PREFIX) ||
+            modelId.endsWith(":free") ||
+            modelId.substringAfterLast('/').endsWith("-free")
 
     /** `cline-pass/qwen3.8-max` → `Qwen3.8-Max`。 */
     private fun prettify(modelId: String): String {

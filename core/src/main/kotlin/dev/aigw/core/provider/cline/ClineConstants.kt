@@ -47,20 +47,30 @@ object ClineConstants {
      * 上游目录拉不到时的兜底模型（官方目录快照）。
      *
      * 只放确定存在的 id：宁可少列，也不要让用户选到一个必然 404 的模型。
+     * 本清单按 `GET /api/v1/ai/cline/recommended-models` 的实时返回整理（2026-11-26 核对），
+     * 三组分别是 recommended / free / clinePass。
      */
     val FALLBACK_MODELS = listOf(
+        // recommended（官方推荐，付费按量）
+        "meta/muse-ember",
         "anthropic/claude-sonnet-5.5",
+        "google/gemini-4-argon",
         "anthropic/claude-opus-5.5",
         "openai/gpt-6-astra",
-        "spacexai/grok-4.7",
+        "openai/gpt-6.1-sol",
         "moonshotai/kimi-k3",
-        "cline-free/deepseek-v4.1-flash",
-        "cline-free/mimo-v2.6-flash",
-        "cline-pass/glm-5.3",
+        // free（官方免费档）
+        "cline-free/nemotron-3.5-super-vl",
+        "nvidia/nemotron-3.5-lightning-free",
+        // clinePass（订阅内）
+        "cline-pass/deepseek-v4.1-flash-1017",
         "cline-pass/deepseek-v4-pro",
-        "cline-pass/qwen3.8-max",
+        "cline-pass/glm-5.3",
+        "cline-pass/glm-5.3-flash",
         "cline-pass/kimi-k3",
-        "cline-pass/minimax-m3",
+        "cline-pass/kimi-k3.1-pro",
+        "cline-pass/qwen3.8-max",
+        "cline-pass/minimax-m3.1-flash",
     )
 
     /** 客户端指纹头（Authorization 由调用方补）。 */

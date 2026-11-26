@@ -68,6 +68,21 @@ class ClineAccountTest {
     }
 
     @Test
+    fun `免费模型两套命名都要认出来`() {
+        val provider = ClineProvider()
+        // 推荐流命名
+        assertTrue(provider.isFreeModel("cline-free/nemotron-3.5-super-vl"))
+        assertTrue(provider.isFreeModel("nvidia/nemotron-3.5-lightning-free"))
+        // 云端目录命名（pricing.prompt == 0 的那批）
+        assertTrue(provider.isFreeModel("nvidia/nemotron-3.5-super-vl:free"))
+        assertTrue(provider.isFreeModel("google/gemma-4-26b-a4b-it:free"))
+        // 付费模型不能被误判成免费
+        assertFalse(provider.isFreeModel("anthropic/claude-sonnet-5.5"))
+        assertFalse(provider.isFreeModel("cline-pass/deepseek-v4-pro"))
+        assertFalse(provider.isFreeModel("meta/muse-ember"))
+    }
+
+    @Test
     fun `客户端指纹头齐全且版本号一致`() {
         val headers = ClineConstants.clientHeaders()
         assertEquals(ClineConstants.CLIENT_TYPE, headers["X-CLIENT-TYPE"])

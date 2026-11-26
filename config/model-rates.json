@@ -1,10 +1,13 @@
 {
-  "_comment": "网关助手 模型倍率远程表。App 每 12 小时自动拉一次（也支持模型页手动刷新）。改这里不必发版。字段：base=折扣前基准倍率，discounted=当前仍有效的折扣后倍率，tag=折扣条件，source=数据来源，note=口径说明。0 表示免费。",
-  "version": 2,
+  "_comment": "网关助手 模型倍率远程表。App 每 12 小时自动拉一次（也支持模型页手动刷新）。改这里不必发版。字段：base=折扣前基准倍率，discounted=当前仍有效的折扣后倍率，tag=折扣条件，source=数据来源（官方/公告/实测/内置/上游），note=口径说明。0 表示免费。catpaw 故意留空：妙手没有公开倍率表，实际倍率由模型目录的 rateMultiplier 现场给出，写死一个数字反而会误导。",
+  "version": 3,
   "updated": "2026-11-26",
   "sources": {
     "trae_official": "docs.trae.cn/ide_limited-time-discount-for-builtin-models（2026-11-26 核对）",
-    "trae_community": "forum.trae.cn 173840（2026-08 实测汇总）、175814 / 178015 / 178262（官方公告）"
+    "trae_community": "forum.trae.cn 173840（2026-08 实测汇总）、175814 / 178015 / 178262（官方公告）",
+    "cline": "api.cline.bot/api/v1/ai/cline/recommended-models 与 /ai/cline/models（免登录，2026-11-26 核对）",
+    "today": "无公开倍率接口（/v1/pricing/status 需登录且不含倍率），沿用 App 内置值并标注为「内置」",
+    "codebuddy": "模型目录的 credits 字段，运行时现场读取"
   },
   "providers": {
     "trae": {
@@ -203,47 +206,31 @@
     "today": {
       "deepseek-v4.1-flash": {
         "base": 1,
-        "source": "上游",
-        "note": "Today 按「同类任务消耗倍数」计价；2026-11-26 与 App 内实测一致"
+        "source": "内置",
+        "note": "沿用 App 内置表；/v1/pricing/status 只返回模型选项、不含倍率，未能对上游核对"
       },
       "minimax-m31-flash": {
         "base": 1,
-        "source": "上游",
-        "note": "限时免费已于 2026-10-29 结束，按 1× 计"
+        "source": "实测",
+        "note": "限时免费已于 2026-10-29 结束（用户实测），此后按 1× 计"
       },
       "glm-5.3": {
         "base": 4,
-        "source": "上游",
-        "note": "Today 按「同类任务消耗倍数」计价"
+        "source": "内置",
+        "note": "沿用 App 内置表；未能对上游核对"
       }
     },
-    "catpaw": {
-      "longcat-2.0": {
-        "base": 1,
-        "source": "上游",
-        "note": "妙手无公开倍率表，实际倍率由模型目录的 rateMultiplier 现场给出；这里是换算基准"
-      },
-      "auto": {
-        "base": 1,
-        "source": "上游",
-        "note": "自动选择：实际倍率取决于被选中的模型"
-      }
-    },
+    "catpaw": {},
     "cline": {
-      "cline-free/deepseek-v4.1-flash": {
+      "cline-free/nemotron-3.5-super-vl": {
         "base": 0,
         "source": "官方",
-        "note": "Cline 免费档模型，不计费"
+        "note": "Cline 免费档（recommended-models 的 free 分组，2026-11-26 核对）"
       },
-      "cline-free/mimo-v2.6-flash": {
+      "nvidia/nemotron-3.5-lightning-free": {
         "base": 0,
         "source": "官方",
-        "note": "Cline 免费档模型，不计费"
-      },
-      "cline-free/muse-spark-1.3-contributor": {
-        "base": 0,
-        "source": "官方",
-        "note": "Cline 免费档模型，不计费"
+        "note": "Cline 免费档（同上）"
       }
     }
   }
