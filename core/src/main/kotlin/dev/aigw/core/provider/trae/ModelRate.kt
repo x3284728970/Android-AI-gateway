@@ -12,12 +12,20 @@ import java.util.Locale
  * 取值优先级：官方文档 > 官方社区公告（模型上新帖）> 社区实测。每条都记来源，
  * 因为倍率会随官方调价、活动折扣、会员档位、忙闲时段变化——官方文档也明确写着
  * 「同一个模型在不同用户身份和时段看到的消耗速度不同」，所以界面上只能当参考值展示。
+ *
+ * **这张表是兜底值**：运行时优先用 `dev.aigw.core.rate.RateBook` 里的远程表
+ * （`config/model-rates.json`，每 12 小时自动更新）。远程表没覆盖到的模型才用这里的数字，
+ * 所以调价时改 JSON 就够了，不必发版。
+ *
+ * 最近一次核对：2026-11-26，`docs.trae.cn/ide_limited-time-discount-for-builtin-models`。
+ * 那次核对纠正了三个错值：GLM-5.3 的 5 折（0.39）早已改为 7.5 折并已于 11-16 到期；
+ * DeepSeek-V4.1-Flash 的折扣前基价是 0.12（不是 0.16）；Seed-2.1-Pro 不再出现在官方折扣页。
  */
 data class ModelRate(
     /** 折扣前的基准倍率。0 表示该模型不计费。 */
     val base: Double,
     val source: RateSource,
-    /** 官方明确公告的限时折扣后倍率；未公告则为 null。会随会员档位与时段变化。 */
+    /** 官方明确公告的限时折扣后倍率；未公告或已过期则为 null。会随会员档位与时段变化。 */
     val discounted: Double? = null,
     /** 折扣的生效条件短标签，如「会员5折」「空闲5折」；无折扣为 null。 */
     val discountTag: String? = null,
@@ -63,7 +71,7 @@ enum class RateSource(val tag: String) {
  */
 object ModelRates {
 
-    private const val SOURCE_DOC = "来源：docs.trae.cn《内置模型限时折扣》"
+    private const val SOURCE_DOC = "来源：docs.trae.cn《内置模型限时折扣》（2026-11-26 核对）"
 
     /** 查倍率；没有公开数据时返回 null（界面不展示，不要瞎猜）。 */
     fun rateOf(modelId: String): ModelRate? = TABLE[modelId.trim().lowercase(Locale.US)]
@@ -96,32 +104,53 @@ object ModelRates {
         note = note,
     )
 
-    /**
-     * 官方文档口径（`docs.trae.cn/ide_limited-time-discount-for-builtin-models`，2026-09 抓取）：
-     * 表里给的是「折扣前积分消耗速度」。
-     */
-    private val GLM_5X = official(0.78, "$SOURCE_DOC；会员享 5 折", 0.39, "会员5折")
-    private val SEED_PRO = official(0.8, "$SOURCE_DOC；9/24 前限时 1 折", 0.08, "限时1折")
-    private val SEED_TURBO = official(0.4, "$SOURCE_DOC；会员享 2.5 折", 0.1, "会员2.5折")
-    private val SEED_CODE = official(0.12, "$SOURCE_DOC；会员享 2.5 折", 0.03, "会员2.5折")
-    private val DS_PRO = official(0.72, "$SOURCE_DOC；22:00-次日 8:00 享 5 折", 0.36, "空闲5折")
-    private val DS_FLASH = official(0.16, "$SOURCE_DOC；免费用户空闲时段 5 折，会员全时段 5 折", 0.08, "5折")
+    /** 官方文档写的是「折扣前积分消耗速度」，折扣按当前（2026-11-26）仍有效的口径填写。 */
+    private val GLM_5_3 = official(
+        0.78,
+        "$SOURCE_DOC；11/16 前的 7.5 折（0.58×）已结束，现按基准 0.78× 计",
+    )
+    private val SEED_TURBO = official(
+        0.4,
+        "$SOURCE_DOC；免费用户全时段 5 折（0.2×），付费会员 2.5 折（0.1×）",
+        0.1,
+        "会员2.5折",
+    )
+    private val SEED_CODE = official(
+        0.12,
+        "$SOURCE_DOC；免费用户全时段 5 折（0.06×），付费会员 2.5 折（0.03×）",
+        0.03,
+        "会员2.5折",
+    )
+    private val DS_PRO = official(
+        0.72,
+        "$SOURCE_DOC；忙时 0.72×，空闲时段（22:00-次日 8:00）5 折 0.36×",
+        0.36,
+        "空闲5折",
+    )
+    private val DS_FLASH = official(
+        0.12,
+        "$SOURCE_DOC；忙时 0.12×，空闲时段 5 折 0.06×（会员忙时 7.5 折已于 11/16 到期）",
+        0.06,
+        "空闲5折",
+    )
 
     private val CUSTOM_MODEL = official(0.0, "官方：仅内置模型消耗积分，自定义模型不消耗积分")
 
     private val TABLE: Map<String, ModelRate> = buildMap {
         // ---- 豆包 / Seed 系 ----
-        put("seed-evolving", SEED_PRO)
-        put("doubao-seed-evolving", SEED_PRO)
+        // 官方折扣页已不再列出 Evolving / 2.1-Pro：沿用历史值与社区实测，并如实标注
+        val seedEvolving = community(0.8, "官方折扣页不再列出，沿用 2026-09 官方文档值（0.8×）")
+        put("seed-evolving", seedEvolving)
+        put("doubao-seed-evolving", seedEvolving)
 
-        put("seed-2.1-pro", SEED_PRO)
-        put("doubao-seed-2.1-pro", SEED_PRO)
+        val seedPro = community(0.77, "社区实测汇总（forum.trae.cn 173840，2026-08）：会员实付 0.77×；官方折扣页未列出")
+        put("seed-2.1-pro", seedPro)
+        put("doubao-seed-2.1-pro", seedPro)
 
         put("seed-2.1-turbo", SEED_TURBO)
         put("doubao-seed-2.1-turbo", SEED_TURBO)
 
-        // 官方折扣文档写作 Seed-2.1-Code，模型清单里出现过三种写法：
-        // Seed-Code / Doubao-Seed-Code / Doubao-Seed-2.0-Code，视作同一模型。
+        // 官方折扣文档写作 Seed-Code，模型清单里出现过三种写法，视作同一模型。
         put("seed-code", SEED_CODE)
         put("seed-2.1-code", SEED_CODE)
         put("seed-2.0-code", SEED_CODE)
@@ -129,8 +158,9 @@ object ModelRates {
         put("doubao-seed-2.0-code", SEED_CODE)
 
         // ---- GLM 系 ----
-        put("glm-5.3", GLM_5X)
-        put("glm-5.2", GLM_5X)
+        put("glm-5.3", GLM_5_3)
+        // GLM-5.2 官方折扣页未列，社区实测会员实付 0.40×
+        put("glm-5.2", community(0.40, "社区实测汇总（forum.trae.cn 173840，2026-08）：会员实付 0.40×；官方折扣页未列出"))
         put("glm-5", community(0.70, "社区实测汇总（forum.trae.cn 173840，2026-08）"))
         put(
             "glm-5.3-flash",
@@ -141,8 +171,11 @@ object ModelRates {
         // 2026-09-10 官方公告移除预览版、正式版继承模型名，故两个 ID 都按正式版记
         put("deepseek-v4-pro", DS_PRO)
         put("deepseek-v4-pro-official", DS_PRO)
+        // 官方文档现写作 DeepSeek-V4.1-Flash，清单里 V4 / V4.1 两种 ID 都出现过
         put("deepseek-v4-flash", DS_FLASH)
         put("deepseek-v4-flash-official", DS_FLASH)
+        put("deepseek-v4.1-flash", DS_FLASH)
+        put("deepseek-v4.1-flash-official", DS_FLASH)
 
         // ---- 千问系 ----
         put("qwen3.8-max", announcement(1.50, "官方社区模型上新公告（forum.trae.cn 175814）"))

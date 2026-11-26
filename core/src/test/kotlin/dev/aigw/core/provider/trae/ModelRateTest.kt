@@ -16,9 +16,10 @@ class ModelRateTest {
 
     @Test
     fun `官方文档口径的倍率与折扣`() {
+        // 2026-11-26 核对：GLM-5.3 的 7.5 折已于 11/16 到期，现按基价计
         val glm = ModelRates.rateOf("glm-5.3")!!
         assertEquals(0.78, glm.base)
-        assertEquals(0.39, glm.discounted, "会员 5 折")
+        assertNull(glm.discounted, "7.5 折已于 11/16 到期，不应再显示折扣价")
         assertEquals(RateSource.OFFICIAL, glm.source)
 
         val turbo = ModelRates.rateOf("Doubao-Seed-2.1-Turbo")!!
@@ -29,17 +30,20 @@ class ModelRateTest {
         assertEquals(0.12, code.base)
         assertEquals(0.03, code.discounted)
 
+        // Evolving 已从官方折扣页移除，沿用历史值且不再宣称折扣
         val evo = ModelRates.rateOf("Doubao-Seed-Evolving")!!
         assertEquals(0.8, evo.base)
-        assertEquals(0.08, evo.discounted, "9/24 前限时 1 折")
+        assertNull(evo.discounted, "官方折扣页已不列该模型，不应再显示 1 折")
 
         val dsPro = ModelRates.rateOf("DeepSeek-V4-Pro")!!
         assertEquals(0.72, dsPro.base)
         assertEquals(0.36, dsPro.discounted, "空闲时段 5 折")
 
+        // 官方页现写作 DeepSeek-V4.1-Flash：折扣前 0.12（此前表里写的 0.16 是错的）
         val dsFlash = ModelRates.rateOf("DeepSeek-V4-Flash")!!
-        assertEquals(0.16, dsFlash.base)
-        assertEquals(0.08, dsFlash.discounted)
+        assertEquals(0.12, dsFlash.base)
+        assertEquals(0.06, dsFlash.discounted)
+        assertEquals(dsFlash, ModelRates.rateOf("DeepSeek-V4.1-Flash"))
     }
 
     @Test
@@ -98,7 +102,8 @@ class ModelRateTest {
     @Test
     fun `官方折扣必须同时带数值与条件标签`() {
         // 回归：构造 ModelRate 时曾用位置参数，插入新字段后 note 被错位写进 discountTag
-        for (id in listOf("glm-5.3", "seed-2.1-turbo", "doubao-seed-code", "deepseek-v4-pro")) {
+        // GLM-5.3 的折扣已到期，不再属于「带折扣」的条目
+        for (id in listOf("seed-2.1-turbo", "doubao-seed-code", "deepseek-v4-pro")) {
             val rate = ModelRates.rateOf(id)!!
             assertNotNull(rate.discounted, "$id 官方有折扣数据")
             assertNotNull(rate.discountTag, "$id 折扣应带条件标签")
@@ -110,8 +115,8 @@ class ModelRateTest {
     fun `一行式摘要把原价与折后价写在一处`() {
         // 回归：徽标曾单独展示基准倍率、下方折扣行又展示折后价，
         // 同一模型出现两个数字容易被误读成重复。
-        assertEquals("限时 0.08×（限时1折，基准 0.8×）", ModelRates.rateOf("Doubao-Seed-Evolving")!!.summaryLabel())
-        assertEquals("限时 0.39×（会员5折，基准 0.78×）", ModelRates.rateOf("glm-5.3")!!.summaryLabel())
+        assertEquals("基准 0.8×", ModelRates.rateOf("Doubao-Seed-Evolving")!!.summaryLabel())
+        assertEquals("限时 0.1×（会员2.5折，基准 0.4×）", ModelRates.rateOf("seed-2.1-turbo")!!.summaryLabel())
         // 无折扣的模型也必须看到具体数字，不能只剩来源行
         assertEquals("基准 1.65×", ModelRates.rateOf("kimi-k3")!!.summaryLabel())
         assertEquals("基准 0.7×", ModelRates.rateOf("glm-5")!!.summaryLabel())
